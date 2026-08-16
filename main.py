@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from graph import DEFAULT_ANALYSIS, analyse_query, build_graph, stream_answer
+from graph import DEFAULT_ANALYSIS, build_graph, stream_graph
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -90,7 +90,9 @@ def health():
         "stack": {
             "langchain": True,
             "langgraph": True,
-            "streaming": True,
+            "streaming": "langgraph.stream",
+            "stream_mode": ["updates", "messages"],
+            "stream_version": "v2",
             "query_analyser": True,
         },
     }
@@ -125,16 +127,8 @@ def chat_stream(req: ChatRequest):
 
     def generate():
         try:
-            analysis = analyse_query(messages, api_key, GROQ_MODEL)
-            yield sse({"type": "analysis", "analysis": analysis, "model": GROQ_MODEL})
-            reply_parts: list[str] = []
-            for token in stream_answer(messages, analysis, api_key, GROQ_MODEL):
-                reply_parts.append(token)
-                yield sse({"type": "token", "content": token})
-            if not "".join(reply_parts).strip():
-                yield sse({"type": "error", "detail": "Groq returned an empty reply"})
-                return
-            yield sse({"type": "done", "model": GROQ_MODEL})
+            for event in stream_graph(messages, api_key, GROQ_MODEL):
+                yield sse(event)
         except Exception as exc:
             yield sse({"type": "error", "detail": f"LangGraph error: {exc}"})
 

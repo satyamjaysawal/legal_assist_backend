@@ -3,6 +3,7 @@ import re
 from typing import Any, Iterator, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
 from langgraph.graph import END, START, StateGraph
 
@@ -66,6 +67,7 @@ def get_llm(api_key: str, model: str, temperature: float = 0.4) -> ChatGroq:
         model=model,
         temperature=temperature,
         max_tokens=1024,
+        streaming=True,
     )
 
 
@@ -95,7 +97,7 @@ def parse_analysis(text: str, fallback_query: str) -> QueryAnalysis:
         analysis["summary"] = fallback_query[:160]
         return analysis
 
-    analysis: QueryAnalysis = {
+    return {
         "intent": str(data.get("intent") or "question"),
         "domain": str(data.get("domain") or "general"),
         "complexity": str(data.get("complexity") or "simple"),
@@ -104,7 +106,6 @@ def parse_analysis(text: str, fallback_query: str) -> QueryAnalysis:
         "summary": str(data.get("summary") or fallback_query)[:240],
         "refined_query": str(data.get("refined_query") or fallback_query),
     }
-    return analysis
 
 
 def latest_user_text(messages: list[dict[str, str]]) -> str:
@@ -114,21 +115,9 @@ def latest_user_text(messages: list[dict[str, str]]) -> str:
     return ""
 
 
-def analyse_query(messages: list[dict[str, str]], api_key: str, model: str) -> QueryAnalysis:
-    user_text = latest_user_text(messages)
-    llm = get_llm(api_key, model, temperature=0.1)
-    result = llm.invoke(to_lc_messages(messages[-6:], ANALYZER_PROMPT))
-    return parse_analysis(str(result.content or ""), user_text)
-
-
-def stream_answer(
-    messages: list[dict[str, str]],
-    analysis: QueryAnalysis,
-    api_key: str,
-    model: str,
-) -> Iterator[str]:
-    context = (
-        f"\n\nQuery analysis:\n"
+def analysis_context(analysis: QueryAnalysis) -> str:
+    return (
+        "\n\nQuery analysis:\n"
         f"- intent: {analysis['intent']}\n"
         f"- domain: {analysis['domain']}\n"
         f"- complexity: {analysis['complexity']}\n"
@@ -137,30 +126,94 @@ def stream_answer(
         f"- summary: {analysis['summary']}\n"
         f"- refined_query: {analysis['refined_query']}"
     )
-    llm = get_llm(api_key, model, temperature=0.4)
-    for chunk in llm.stream(to_lc_messages(messages, ANSWER_PROMPT + context)):
-        text = chunk.content
-        if text:
-            yield text
 
 
-def _analyse_node(state: AgentState, api_key: str, model: str) -> dict[str, Any]:
-    return {"analysis": analyse_query(state["messages"], api_key, model)}
+def message_text(message: Any) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "".join(parts)
+    return str(content or "")
 
 
-def _generate_node(state: AgentState, api_key: str, model: str) -> dict[str, Any]:
-    analysis = state.get("analysis") or DEFAULT_ANALYSIS
-    parts: list[str] = []
-    for token in stream_answer(state["messages"], analysis, api_key, model):
-        parts.append(token)
-    return {"reply": "".join(parts).strip()}
+def unpack_stream_part(part: Any) -> tuple[str | None, Any]:
+    if isinstance(part, dict) and part.get("type"):
+        return part.get("type"), part.get("data")
+    if isinstance(part, tuple) and len(part) == 2:
+        return part[0], part[1]
+    return None, None
 
 
 def build_graph(api_key: str, model: str):
+    analyser = get_llm(api_key, model, temperature=0.1)
+    writer = get_llm(api_key, model, temperature=0.4)
+
+    def analyse(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+        user_text = latest_user_text(state["messages"])
+        result = analyser.invoke(
+            to_lc_messages(state["messages"][-6:], ANALYZER_PROMPT),
+            config=config,
+        )
+        return {"analysis": parse_analysis(str(result.content or ""), user_text)}
+
+    def generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+        analysis = state.get("analysis") or DEFAULT_ANALYSIS
+        result = writer.invoke(
+            to_lc_messages(state["messages"], ANSWER_PROMPT + analysis_context(analysis)),
+            config=config,
+        )
+        return {"reply": str(result.content or "").strip()}
+
     graph = StateGraph(AgentState)
-    graph.add_node("analyse", lambda state: _analyse_node(state, api_key, model))
-    graph.add_node("generate", lambda state: _generate_node(state, api_key, model))
+    graph.add_node("analyse", analyse)
+    graph.add_node("generate", generate)
     graph.add_edge(START, "analyse")
     graph.add_edge("analyse", "generate")
     graph.add_edge("generate", END)
     return graph.compile()
+
+
+def stream_graph(
+    messages: list[dict[str, str]],
+    api_key: str,
+    model: str,
+) -> Iterator[dict[str, Any]]:
+    """Yield app events from LangGraph `stream(version='v2')`.
+
+    Uses `stream_mode=['updates', 'messages']`:
+    - updates → analyse node output
+    - messages → generate-node LLM tokens
+    """
+    compiled = build_graph(api_key, model)
+    reply_parts: list[str] = []
+
+    for part in compiled.stream(
+        {"messages": messages, "analysis": None, "reply": ""},
+        stream_mode=["updates", "messages"],
+        version="v2",
+    ):
+        kind, data = unpack_stream_part(part)
+        if kind == "updates" and isinstance(data, dict):
+            node_out = data.get("analyse") or {}
+            if isinstance(node_out, dict) and node_out.get("analysis"):
+                yield {"type": "analysis", "analysis": node_out["analysis"], "model": model}
+        elif kind == "messages" and isinstance(data, tuple) and len(data) == 2:
+            message, metadata = data
+            if metadata.get("langgraph_node") != "generate":
+                continue
+            text = message_text(message)
+            if text:
+                reply_parts.append(text)
+                yield {"type": "token", "content": text}
+
+    if not "".join(reply_parts).strip():
+        yield {"type": "error", "detail": "Groq returned an empty reply"}
+        return
+    yield {"type": "done", "model": model}

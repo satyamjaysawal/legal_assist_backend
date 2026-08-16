@@ -21,10 +21,11 @@ FastAPI chat API with **LangChain + LangGraph**, a **query analyser**, and **SSE
 
 ## Features
 
-- LangGraph flow: **analyse query → generate answer**
+- LangGraph flow: **analyse → generate**
+- Streaming via `graph.stream(..., stream_mode=["updates", "messages"], version="v2")`
 - Query analyser classifies intent, domain, complexity, jurisdiction
-- `POST /chat/stream` — SSE tokens after analysis
-- `POST /chat` — same graph, full JSON reply
+- `POST /chat/stream` — SSE from LangGraph updates + LLM tokens
+- `POST /chat` — same graph, full JSON reply (`graph.invoke`)
 - `GET /health` — model + stack flags (no secrets)
 - Groq key stays server-side (`GROQ_API_KEY`)
 
