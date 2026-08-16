@@ -232,6 +232,31 @@ def load_long_term(user_id: str, query: str) -> tuple[list[dict[str, Any]], dict
         return [], report
 
 
+def list_user_facts(user_id: str, limit: int = 40) -> list[dict[str, Any]]:
+    client = get_mongo()
+    if client is None or not user_id:
+        return []
+    docs = list(
+        client[MONGO_DB][LTM_COLLECTION]
+        .find({"user_id": user_id}, {"_id": 0})
+        .sort("created_at", -1)
+        .limit(limit)
+    )
+    return [
+        {
+            "summary": item.get("summary") or item.get("query") or "",
+            "query": item.get("query") or "",
+            "domain": item.get("domain") or "general",
+            "intent": item.get("intent") or "",
+            "journey_id": item.get("journey_id") or item.get("session_id") or "",
+            "reply_excerpt": item.get("reply_excerpt") or "",
+            "created_at": item.get("created_at") or "",
+        }
+        for item in docs
+        if item.get("summary") or item.get("query")
+    ]
+
+
 def merge_history(*histories: list[dict[str, str]]) -> list[dict[str, str]]:
     longest: list[dict[str, str]] = []
     for hist in histories:

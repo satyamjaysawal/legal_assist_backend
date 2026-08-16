@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from auth import current_user, login_user, make_token, register_user, update_user
 from graph import DEFAULT_ANALYSIS, build_graph, latest_user_text, stream_graph
 from journeys import create_journey, get_journey, list_journeys
-from memory import layer_status, load_all, save_all
+from memory import layer_status, list_user_facts, load_all, save_all
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -155,6 +155,23 @@ def journeys_list(user: dict = Depends(current_user)):
 @app.post("/journeys")
 def journeys_create(payload: JourneyCreate, user: dict = Depends(current_user)):
     return create_journey(user["user_id"], payload.title)
+
+
+@app.get("/memory")
+def memory_detail(journey_id: str = "", user: dict = Depends(current_user)):
+    journey_id = (journey_id or "").strip()
+    loaded = None
+    if journey_id:
+        loaded = load_all(user["user_id"], journey_id, [], "")
+    return {
+        "user_id": user["user_id"],
+        "journey_id": journey_id,
+        "stores": layer_status(),
+        "layers": loaded["layers"] if loaded else [],
+        "facts": list_user_facts(user["user_id"]),
+        "recalled": loaded["facts"] if loaded else [],
+        "thread": loaded["history"] if loaded else [],
+    }
 
 
 @app.get("/journeys/{journey_id}")
