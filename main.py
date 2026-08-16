@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -19,7 +19,18 @@ from graph import (
 )
 from journeys import create_journey, get_journey, list_journeys, rename_journey
 from cache import get_prompt_cache, set_prompt_cache
+from docs import chunk_text, parse_file
+from embeddings import embed_status
 from memory import layer_status, list_user_facts, load_all, save_all
+from vectordb import (
+    delete_doc,
+    format_hits,
+    hits_fingerprint,
+    ingest_document,
+    list_docs,
+    qdrant_status,
+    search_docs,
+)
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -127,8 +138,13 @@ def health():
             "auth": "mongodb",
             "memory": ["in_memory", "short_term_redis", "user_thread_mongo", "long_term_mongodb"],
             "prompt_cache": True,
+            "rag": True,
+            "uploads": ["pdf", "docx", "text", "image"],
+            "embed_model": os.getenv("GROQ_EMBED_MODEL", "nomic-embed-text-v1.5"),
         },
         "memory": layer_status(),
+        "qdrant": qdrant_status(),
+        "embeddings": embed_status(),
     }
 
 
@@ -189,7 +205,50 @@ def memory_detail(journey_id: str = "", user: dict = Depends(current_user)):
         "facts": list_user_facts(user["user_id"]),
         "recalled": loaded["facts"] if loaded else [],
         "thread": loaded["history"] if loaded else [],
+        "documents": list_docs(user["user_id"], journey_id) if journey_id else list_docs(user["user_id"]),
+        "qdrant": qdrant_status(),
+        "embeddings": embed_status(),
     }
+
+
+@app.post("/documents/upload")
+async def documents_upload(
+    file: UploadFile = File(...),
+    journey_id: str = Form(""),
+    user: dict = Depends(current_user),
+):
+    journey = resolve_journey(user, journey_id)
+    data = await file.read()
+    try:
+        parsed = parse_file(file.filename or "upload", file.content_type or "", data)
+        chunks = chunk_text(parsed["text"])
+        if not chunks:
+            raise ValueError("No chunks produced from file")
+        stored = ingest_document(user["user_id"], journey["journey_id"], parsed, chunks)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not ingest file: {exc}") from exc
+    return {
+        "ok": True,
+        "journey_id": journey["journey_id"],
+        "document": stored,
+        "qdrant": qdrant_status(),
+    }
+
+
+@app.get("/documents")
+def documents_list(journey_id: str = "", user: dict = Depends(current_user)):
+    return {
+        "documents": list_docs(user["user_id"], journey_id),
+        "qdrant": qdrant_status(),
+        "embeddings": embed_status(),
+    }
+
+
+@app.delete("/documents/{doc_id}")
+def documents_delete(doc_id: str, user: dict = Depends(current_user)):
+    return delete_doc(user["user_id"], doc_id)
 
 
 @app.get("/journeys/{journey_id}")
@@ -233,8 +292,19 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
                 }
             )
 
+            yield sse({"type": "thinking", "text": "Searching uploaded documents in Qdrant…"})
+            hits, rag_report = search_docs(user_id, query, journey_id)
+            rag_notes = format_hits(hits)
+            rag_key = hits_fingerprint(hits)
+            yield step(
+                "rag",
+                rag_report.get("status") or "miss",
+                rag_report.get("detail") or "Document search",
+            )
+            yield sse({"type": "retrieval", "report": rag_report, "hits": hits})
+
             yield sse({"type": "thinking", "text": "Checking prompt cache…"})
-            cached, cache_report = get_prompt_cache(query, GROQ_MODEL)
+            cached, cache_report = get_prompt_cache(query, GROQ_MODEL, rag_key)
             yield sse({"type": "cache", "report": cache_report})
 
             if cached and cached.get("reply"):
@@ -280,6 +350,7 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
                 api_key,
                 GROQ_MODEL,
                 memory_notes=loaded["notes"],
+                rag_notes=rag_notes,
             ):
                 if event.get("type") == "analysis":
                     analysis = event.get("analysis")
@@ -317,6 +388,7 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
                         "followups": followups,
                         "title": title,
                     },
+                    rag_key,
                 )
                 yield sse({"type": "cache_write", "report": cache_write})
                 stored = loaded["history"] + [{"role": "assistant", "content": reply}]
@@ -356,6 +428,7 @@ def chat(req: ChatRequest, user: dict = Depends(current_user)):
     user_id = user["user_id"]
     query = latest_user_text(incoming)
     loaded = load_all(user_id, journey_id, incoming, query)
+    hits, rag_report = search_docs(user_id, query, journey_id)
     try:
         result = build_graph(api_key, GROQ_MODEL).invoke(
             {
@@ -363,6 +436,7 @@ def chat(req: ChatRequest, user: dict = Depends(current_user)):
                 "analysis": None,
                 "reply": "",
                 "memory_notes": loaded["notes"],
+                "rag_notes": format_hits(hits),
             }
         )
     except Exception as exc:
@@ -381,4 +455,5 @@ def chat(req: ChatRequest, user: dict = Depends(current_user)):
         "session_id": journey_id,
         "user_id": user_id,
         "memory": {"layers": loaded["layers"], "writes": writes, "facts": loaded["facts"]},
+        "retrieval": {"report": rag_report, "hits": hits},
     }

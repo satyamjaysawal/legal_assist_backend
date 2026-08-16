@@ -1,0 +1,279 @@
+import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / "legal_assist" / ".env")
+
+from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PayloadSchemaType,
+    PointStruct,
+    VectorParams,
+)
+
+from embeddings import EMBED_DIM, GROQ_EMBED_MODEL, embed_texts
+from memory import MONGO_DB, get_mongo
+
+QDRANT_URL = os.getenv("QUDRANT_CLUSTER_ENDPOINT") or os.getenv("QDRANT_URL") or ""
+QDRANT_API_KEY = os.getenv("QUDRANT_VECTOR_DB_API_KEY") or os.getenv("QDRANT_API_KEY") or ""
+COLLECTION = os.getenv("QDRANT_COLLECTION", "legal_assist_docs")
+DOCS_COLLECTION = "documents"
+SEARCH_LIMIT = int(os.getenv("QDRANT_SEARCH_LIMIT", "5"))
+
+_client: QdrantClient | None = None
+_qdrant_error = ""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_qdrant() -> QdrantClient | None:
+    global _client, _qdrant_error
+    if _client is not None:
+        return _client
+    if not QDRANT_URL or not QDRANT_API_KEY:
+        _qdrant_error = "QUDRANT_CLUSTER_ENDPOINT or QUDRANT_VECTOR_DB_API_KEY is not set"
+        return None
+    try:
+        client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=30)
+        client.get_collections()
+        _client = client
+        _qdrant_error = ""
+        return _client
+    except Exception as exc:
+        _qdrant_error = str(exc)
+        return None
+
+
+def qdrant_status() -> dict[str, Any]:
+    client = get_qdrant()
+    points = 0
+    if client is not None:
+        try:
+            info = client.get_collection(COLLECTION)
+            points = int(getattr(info, "points_count", 0) or 0)
+        except Exception:
+            points = 0
+    return {
+        "ok": client is not None,
+        "store": "qdrant",
+        "host": QDRANT_URL,
+        "collection": COLLECTION,
+        "points": points,
+        "embed_model": GROQ_EMBED_MODEL,
+        "error": _qdrant_error,
+    }
+
+
+def ensure_collection() -> QdrantClient:
+    client = get_qdrant()
+    if client is None:
+        raise RuntimeError(_qdrant_error or "Qdrant is unavailable")
+    if not client.collection_exists(COLLECTION):
+        client.create_collection(
+            collection_name=COLLECTION,
+            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+        )
+    for field in ("user_id", "journey_id", "doc_id"):
+        try:
+            client.create_payload_index(
+                collection_name=COLLECTION,
+                field_name=field,
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+        except Exception:
+            pass
+    return client
+
+
+def _docs_col():
+    mongo = get_mongo()
+    if mongo is None:
+        return None
+    return mongo[MONGO_DB][DOCS_COLLECTION]
+
+
+def save_doc_meta(meta: dict[str, Any]) -> None:
+    col = _docs_col()
+    if col is None:
+        return
+    col.update_one({"doc_id": meta["doc_id"]}, {"$set": meta}, upsert=True)
+
+
+def list_docs(user_id: str, journey_id: str = "") -> list[dict[str, Any]]:
+    col = _docs_col()
+    if col is None:
+        return []
+    query: dict[str, Any] = {"user_id": user_id}
+    if journey_id:
+        query["journey_id"] = journey_id
+    rows = list(col.find(query, {"_id": 0}).sort("created_at", -1).limit(50))
+    return rows
+
+
+def delete_doc(user_id: str, doc_id: str) -> dict[str, Any]:
+    client = ensure_collection()
+    client.delete(
+        collection_name=COLLECTION,
+        points_selector=Filter(
+            must=[
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
+            ]
+        ),
+    )
+    col = _docs_col()
+    if col is not None:
+        col.delete_one({"user_id": user_id, "doc_id": doc_id})
+    return {"ok": True, "doc_id": doc_id}
+
+
+def ingest_document(
+    user_id: str,
+    journey_id: str,
+    parsed: dict[str, Any],
+    chunks: list[str],
+) -> dict[str, Any]:
+    client = ensure_collection()
+    vectors, embed_report = embed_texts(chunks, kind="document")
+    doc_id = str(uuid.uuid4())
+    created = _now()
+    points = []
+    for index, (chunk, vector) in enumerate(zip(chunks, vectors)):
+        points.append(
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=vector,
+                payload={
+                    "user_id": user_id,
+                    "journey_id": journey_id,
+                    "doc_id": doc_id,
+                    "filename": parsed["filename"],
+                    "kind": parsed["kind"],
+                    "chunk_index": index,
+                    "text": chunk,
+                    "created_at": created,
+                },
+            )
+        )
+    client.upsert(collection_name=COLLECTION, points=points, wait=True)
+    meta = {
+        "doc_id": doc_id,
+        "user_id": user_id,
+        "journey_id": journey_id,
+        "filename": parsed["filename"],
+        "kind": parsed["kind"],
+        "content_type": parsed.get("content_type") or "",
+        "bytes": parsed.get("bytes") or 0,
+        "chars": parsed.get("chars") or 0,
+        "chunks": len(chunks),
+        "embed_model": embed_report.get("model") or GROQ_EMBED_MODEL,
+        "embed_provider": embed_report.get("provider") or "",
+        "created_at": created,
+    }
+    save_doc_meta(meta)
+    return {
+        **meta,
+        "embed": embed_report,
+        "preview": chunks[0][:240] if chunks else "",
+    }
+
+
+def search_docs(
+    user_id: str,
+    query: str,
+    journey_id: str = "",
+    limit: int = SEARCH_LIMIT,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    report = {
+        "name": "qdrant",
+        "label": "Qdrant RAG",
+        "store": "qdrant",
+        "model": GROQ_EMBED_MODEL,
+        "status": "miss",
+        "used": False,
+        "hits": 0,
+        "detail": "No matching document chunks",
+    }
+    if not query.strip():
+        return [], report
+    client = get_qdrant()
+    if client is None:
+        report.update(status="error", detail=_qdrant_error or "Qdrant unavailable")
+        return [], report
+    try:
+        ensure_collection()
+        vectors, embed_report = embed_texts([query], kind="query")
+        must = [FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+        if journey_id:
+            must.append(FieldCondition(key="journey_id", match=MatchValue(value=journey_id)))
+        result = client.query_points(
+            collection_name=COLLECTION,
+            query=vectors[0],
+            query_filter=Filter(must=must),
+            limit=limit,
+            with_payload=True,
+        )
+        hits = []
+        for point in result.points:
+            payload = point.payload or {}
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                continue
+            hits.append(
+                {
+                    "id": str(point.id),
+                    "score": round(float(point.score or 0), 4),
+                    "filename": payload.get("filename") or "",
+                    "kind": payload.get("kind") or "",
+                    "doc_id": payload.get("doc_id") or "",
+                    "chunk_index": payload.get("chunk_index"),
+                    "text": text,
+                }
+            )
+        report["embed"] = embed_report
+        if hits:
+            report.update(
+                status="hit",
+                used=True,
+                hits=len(hits),
+                detail=f"{len(hits)} chunk(s) from {len({h['doc_id'] for h in hits})} file(s)",
+            )
+        else:
+            report["detail"] = "Qdrant query ran, no similar chunks"
+        return hits, report
+    except UnexpectedResponse as exc:
+        report.update(status="error", detail=str(exc))
+        return [], report
+    except Exception as exc:
+        report.update(status="error", detail=str(exc))
+        return [], report
+
+
+def hits_fingerprint(hits: list[dict[str, Any]]) -> str:
+    if not hits:
+        return "none"
+    return ",".join(item.get("id") or "" for item in hits)
+
+
+def format_hits(hits: list[dict[str, Any]]) -> str:
+    if not hits:
+        return ""
+    parts = []
+    for i, hit in enumerate(hits, start=1):
+        parts.append(
+            f"[{i}] {hit.get('filename') or 'document'} "
+            f"(score {hit.get('score')}):\n{hit.get('text')}"
+        )
+    return "\n\n".join(parts)

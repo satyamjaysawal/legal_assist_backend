@@ -19,13 +19,13 @@ def normalize_prompt(query: str) -> str:
     return re.sub(r"\s+", " ", (query or "").strip().lower())
 
 
-def prompt_cache_id(query: str, model: str) -> str:
-    raw = f"{model}|{normalize_prompt(query)}"
+def prompt_cache_id(query: str, model: str, extra: str = "") -> str:
+    raw = f"{model}|{normalize_prompt(query)}|{extra or 'none'}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def prompt_cache_key(query: str, model: str) -> str:
-    return f"legal_assist:pcache:{prompt_cache_id(query, model)}"
+def prompt_cache_key(query: str, model: str, extra: str = "") -> str:
+    return f"legal_assist:pcache:{prompt_cache_id(query, model, extra)}"
 
 
 def cache_status() -> dict[str, Any]:
@@ -38,9 +38,9 @@ def cache_status() -> dict[str, Any]:
     }
 
 
-def get_prompt_cache(query: str, model: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    cache_id = prompt_cache_id(query, model)
-    key = prompt_cache_key(query, model)
+def get_prompt_cache(query: str, model: str, extra: str = "") -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    cache_id = prompt_cache_id(query, model, extra)
+    key = prompt_cache_key(query, model, extra)
     report = {
         "name": "prompt_cache",
         "label": "Prompt cache",
@@ -84,8 +84,8 @@ def get_prompt_cache(query: str, model: str) -> tuple[dict[str, Any] | None, dic
         return None, report
 
 
-def set_prompt_cache(query: str, model: str, payload: dict[str, Any]) -> dict[str, Any]:
-    key = prompt_cache_key(query, model)
+def set_prompt_cache(query: str, model: str, payload: dict[str, Any], extra: str = "") -> dict[str, Any]:
+    key = prompt_cache_key(query, model, extra)
     body = {
         "query": query,
         "model": model,

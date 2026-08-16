@@ -122,6 +122,12 @@ def layer_status() -> dict[str, Any]:
             "store": "redis+memory",
             "ttl_seconds": int(os.getenv("PROMPT_CACHE_TTL", "21600")),
         },
+        "qdrant": {
+            "ok": bool(os.getenv("QUDRANT_CLUSTER_ENDPOINT") and os.getenv("QUDRANT_VECTOR_DB_API_KEY")),
+            "store": "qdrant",
+            "host": os.getenv("QUDRANT_CLUSTER_ENDPOINT") or "",
+            "collection": os.getenv("QDRANT_COLLECTION", "legal_assist_docs"),
+        },
     }
 
 
