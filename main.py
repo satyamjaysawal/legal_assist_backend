@@ -9,8 +9,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from auth import current_user, login_user, make_token, register_user, update_user
-from graph import DEFAULT_ANALYSIS, build_graph, latest_user_text, stream_graph
-from journeys import create_journey, get_journey, list_journeys
+from graph import (
+    DEFAULT_ANALYSIS,
+    build_graph,
+    latest_user_text,
+    stream_graph,
+    suggest_followups,
+    suggest_title,
+)
+from journeys import create_journey, get_journey, list_journeys, rename_journey
 from memory import layer_status, list_user_facts, load_all, save_all
 
 ROOT = Path(__file__).resolve().parent
@@ -54,6 +61,10 @@ class ProfileUpdate(BaseModel):
 
 class JourneyCreate(BaseModel):
     title: str = ""
+
+
+class JourneyRename(BaseModel):
+    title: str
 
 
 class ChatMessage(BaseModel):
@@ -123,7 +134,7 @@ def health():
 def auth_register(payload: AuthPayload):
     user = register_user(payload.email, payload.password, payload.name)
     token = make_token(user["user_id"], user["email"])
-    journey = create_journey(user["user_id"], "First thread")
+    journey = create_journey(user["user_id"], "New chat")
     return {"token": token, "user": user, "journey": journey}
 
 
@@ -132,7 +143,7 @@ def auth_login(payload: AuthPayload):
     user = login_user(payload.email, payload.password)
     token = make_token(user["user_id"], user["email"])
     journeys = list_journeys(user["user_id"])
-    journey = journeys[0] if journeys else create_journey(user["user_id"], "First thread")
+    journey = journeys[0] if journeys else create_journey(user["user_id"], "New chat")
     return {"token": token, "user": user, "journey": journey, "journeys": journeys or [journey]}
 
 
@@ -155,6 +166,11 @@ def journeys_list(user: dict = Depends(current_user)):
 @app.post("/journeys")
 def journeys_create(payload: JourneyCreate, user: dict = Depends(current_user)):
     return create_journey(user["user_id"], payload.title)
+
+
+@app.patch("/journeys/{journey_id}")
+def journeys_rename(journey_id: str, payload: JourneyRename, user: dict = Depends(current_user)):
+    return rename_journey(user["user_id"], journey_id, payload.title)
 
 
 @app.get("/memory")
@@ -220,16 +236,28 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
                 yield sse(event)
             reply = "".join(reply_parts).strip()
             if reply:
+                title = ""
+                try:
+                    title = suggest_title(query, reply, api_key, GROQ_MODEL)
+                except Exception:
+                    title = query[:60]
                 stored = loaded["history"] + [{"role": "assistant", "content": reply}]
-                writes = save_all(journey_id, user_id, stored, query, reply, analysis)
+                writes = save_all(journey_id, user_id, stored, title or query, reply, analysis)
                 yield sse(
                     {
                         "type": "memory_write",
                         "writes": writes,
                         "journey_id": journey_id,
                         "session_id": journey_id,
+                        "title": title,
                     }
                 )
+                try:
+                    followups = suggest_followups(query, reply, api_key, GROQ_MODEL)
+                except Exception:
+                    followups = []
+                if followups:
+                    yield sse({"type": "followups", "questions": followups})
         except Exception as exc:
             yield sse({"type": "error", "detail": f"LangGraph error: {exc}"})
 

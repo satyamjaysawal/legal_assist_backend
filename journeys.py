@@ -38,7 +38,8 @@ def public_journey(doc: dict[str, Any], include_messages: bool = False) -> dict[
     payload = {
         "journey_id": doc.get("journey_id"),
         "user_id": doc.get("user_id"),
-        "title": doc.get("title") or "New thread",
+        "title": doc.get("title") or "New chat",
+        "title_locked": bool(doc.get("title_locked")),
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
         "message_count": len(messages),
@@ -54,7 +55,8 @@ def create_journey(user_id: str, title: str = "") -> dict[str, Any]:
     doc = {
         "journey_id": str(uuid4()),
         "user_id": user_id,
-        "title": (title or "New thread").strip()[:80],
+        "title": (title or "New chat").strip()[:80],
+        "title_locked": False,
         "messages": [],
         "created_at": now,
         "updated_at": now,
@@ -88,14 +90,30 @@ def save_journey_thread(
     doc = col.find_one({"user_id": user_id, "journey_id": journey_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Journey not found")
-    title = doc.get("title") or "New thread"
-    if (not title or title == "New thread") and title_hint:
-        title = title_hint.strip()[:80]
+    title = doc.get("title") or "New chat"
+    locked = bool(doc.get("title_locked"))
+    auto = (title_hint or "").strip()
+    if not locked and auto and title in {"New chat", "New thread", "First thread"}:
+        title = auto[:80]
     col.update_one(
         {"user_id": user_id, "journey_id": journey_id},
         {"$set": {"messages": cleaned, "title": title, "updated_at": _now()}},
     )
     return {"wrote": True, "turns": len(cleaned), "title": title}
+
+
+def rename_journey(user_id: str, journey_id: str, title: str) -> dict[str, Any]:
+    title = (title or "").strip()[:80]
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+    col = journeys_col()
+    result = col.update_one(
+        {"user_id": user_id, "journey_id": journey_id},
+        {"$set": {"title": title, "title_locked": True, "updated_at": _now()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Journey not found")
+    return get_journey(user_id, journey_id)
 
 
 def load_journey_messages(user_id: str, journey_id: str) -> list[dict[str, str]]:
