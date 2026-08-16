@@ -18,6 +18,7 @@ from graph import (
     suggest_title,
 )
 from journeys import create_journey, get_journey, list_journeys, rename_journey
+from cache import get_prompt_cache, set_prompt_cache
 from memory import layer_status, list_user_facts, load_all, save_all
 
 ROOT = Path(__file__).resolve().parent
@@ -125,6 +126,7 @@ def health():
             "query_analyser": True,
             "auth": "mongodb",
             "memory": ["in_memory", "short_term_redis", "user_thread_mongo", "long_term_mongodb"],
+            "prompt_cache": True,
         },
         "memory": layer_status(),
     }
@@ -211,6 +213,15 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
 
     def generate():
         try:
+            flow = []
+
+            def step(name, status, detail=""):
+                item = {"name": name, "status": status, "detail": detail}
+                flow.append(item)
+                return sse({"type": "flow", "steps": flow[:], "current": name})
+
+            yield sse({"type": "thinking", "text": "Loading memory stores…"})
+            yield step("memory", "done", "Loaded in-memory, Redis, thread, long-term")
             yield sse(
                 {
                     "type": "memory",
@@ -221,6 +232,47 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
                     "facts": loaded["facts"],
                 }
             )
+
+            yield sse({"type": "thinking", "text": "Checking prompt cache…"})
+            cached, cache_report = get_prompt_cache(query, GROQ_MODEL)
+            yield sse({"type": "cache", "report": cache_report})
+
+            if cached and cached.get("reply"):
+                yield step("prompt_cache", "hit", cache_report.get("detail") or "Cache hit")
+                analysis = cached.get("analysis") or DEFAULT_ANALYSIS
+                yield sse({"type": "thinking", "text": "Using cached analysis…"})
+                yield step("analyser", "cached", analysis.get("summary") or "Cached analysis")
+                yield sse({"type": "analysis", "analysis": analysis, "model": GROQ_MODEL, "cached": True})
+                yield sse({"type": "thinking", "text": "Replaying cached answer…"})
+                yield step("generate", "cached", "Answer served from prompt cache")
+                yield sse({"type": "token", "content": cached["reply"]})
+                yield sse({"type": "done", "model": GROQ_MODEL, "cached": True})
+                stored = loaded["history"] + [{"role": "assistant", "content": cached["reply"]}]
+                writes = save_all(
+                    journey_id,
+                    user_id,
+                    stored,
+                    cached.get("title") or query,
+                    cached["reply"],
+                    analysis,
+                )
+                yield sse(
+                    {
+                        "type": "memory_write",
+                        "writes": writes,
+                        "journey_id": journey_id,
+                        "session_id": journey_id,
+                        "title": cached.get("title") or "",
+                    }
+                )
+                if cached.get("followups"):
+                    yield sse({"type": "followups", "questions": cached["followups"]})
+                yield sse({"type": "thinking", "text": "Done (prompt cache)."})
+                return
+
+            yield step("prompt_cache", "miss", "No cached prompt, calling model")
+            yield sse({"type": "thinking", "text": "Analysing the legal query…"})
+            yield step("analyser", "running", "LangGraph analyse node")
             analysis = None
             reply_parts: list[str] = []
             for event in stream_graph(
@@ -231,16 +283,42 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
             ):
                 if event.get("type") == "analysis":
                     analysis = event.get("analysis")
+                    yield step("analyser", "done", (analysis or {}).get("summary") or "Analysed")
+                    yield sse({"type": "thinking", "text": "Writing the answer…"})
+                    yield step("generate", "running", "LangGraph generate node")
                 if event.get("type") == "token":
                     reply_parts.append(event.get("content") or "")
+                if event.get("type") == "done":
+                    yield step("generate", "done", "Answer generated")
                 yield sse(event)
             reply = "".join(reply_parts).strip()
             if reply:
                 title = ""
+                yield sse({"type": "thinking", "text": "Naming this chat…"})
                 try:
                     title = suggest_title(query, reply, api_key, GROQ_MODEL)
+                    yield step("title", "done", title)
                 except Exception:
                     title = query[:60]
+                    yield step("title", "done", title)
+                followups: list[str] = []
+                yield sse({"type": "thinking", "text": "Suggesting follow-up questions…"})
+                try:
+                    followups = suggest_followups(query, reply, api_key, GROQ_MODEL)
+                    yield step("followups", "done", f"{len(followups)} questions")
+                except Exception:
+                    yield step("followups", "skip", "Could not suggest follow-ups")
+                cache_write = set_prompt_cache(
+                    query,
+                    GROQ_MODEL,
+                    {
+                        "reply": reply,
+                        "analysis": analysis or DEFAULT_ANALYSIS,
+                        "followups": followups,
+                        "title": title,
+                    },
+                )
+                yield sse({"type": "cache_write", "report": cache_write})
                 stored = loaded["history"] + [{"role": "assistant", "content": reply}]
                 writes = save_all(journey_id, user_id, stored, title or query, reply, analysis)
                 yield sse(
@@ -252,12 +330,9 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
                         "title": title,
                     }
                 )
-                try:
-                    followups = suggest_followups(query, reply, api_key, GROQ_MODEL)
-                except Exception:
-                    followups = []
                 if followups:
                     yield sse({"type": "followups", "questions": followups})
+                yield sse({"type": "thinking", "text": "Done."})
         except Exception as exc:
             yield sse({"type": "error", "detail": f"LangGraph error: {exc}"})
 

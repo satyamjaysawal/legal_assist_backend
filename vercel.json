@@ -5,7 +5,7 @@
       "src": "main.py",
       "use": "@vercel/python",
       "config": {
-        "includeFiles": ["graph.py", "memory.py", "auth.py", "journeys.py"]
+        "includeFiles": ["graph.py", "memory.py", "auth.py", "journeys.py", "cache.py"]
       }
     }
   ],

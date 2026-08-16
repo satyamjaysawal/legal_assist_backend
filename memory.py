@@ -117,6 +117,11 @@ def layer_status() -> dict[str, Any]:
             "collection": LTM_COLLECTION,
             "error": _mongo_error,
         },
+        "prompt_cache": {
+            "ok": redis_ok,
+            "store": "redis+memory",
+            "ttl_seconds": int(os.getenv("PROMPT_CACHE_TTL", "21600")),
+        },
     }
 
 
