@@ -1,10 +1,10 @@
 # Legal Assist — Backend
 
-FastAPI chat API powered by **Groq** (`llama-3.3-70b-versatile`).
+FastAPI chat API with **LangChain + LangGraph**, a **query analyser**, and **SSE streaming**, on **Groq** (`llama-3.3-70b-versatile`).
 
 | Layer | Stack |
 | --- | --- |
-| **Backend** | FastAPI + Groq |
+| **Backend** | FastAPI + LangChain + LangGraph + Groq |
 | **Frontend** | Vite + React ([separate repo](https://github.com/satyamjaysawal/legal_assist_frontend)) |
 
 ## Live production (Vercel)
@@ -21,16 +21,19 @@ FastAPI chat API powered by **Groq** (`llama-3.3-70b-versatile`).
 
 ## Features
 
-- `POST /chat` — send conversation history, get a Groq reply
-- `GET /health` — model + API-key status (no secrets)
-- CORS for local Vite (`localhost:5173`) and `*.vercel.app`
+- LangGraph flow: **analyse query → generate answer**
+- Query analyser classifies intent, domain, complexity, jurisdiction
+- `POST /chat/stream` — SSE tokens after analysis
+- `POST /chat` — same graph, full JSON reply
+- `GET /health` — model + stack flags (no secrets)
 - Groq key stays server-side (`GROQ_API_KEY`)
 
 ## File structure
 
 ```
 legal_assist_backend/
-├── main.py            # FastAPI app
+├── main.py            # FastAPI routes
+├── graph.py           # LangGraph analyser + answer nodes
 ├── requirements.txt
 ├── runtime.txt        # Python 3.12 for Vercel
 ├── vercel.json        # @vercel/python → main.py
@@ -74,8 +77,9 @@ Run the frontend separately on http://127.0.0.1:5173 (Vite proxies `/chat` and `
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/` | Service ping |
-| GET | `/health` | Health + model name |
-| POST | `/chat` | Chat completion |
+| GET | `/health` | Health + model + stack |
+| POST | `/chat` | Full LangGraph reply (JSON) |
+| POST | `/chat/stream` | Analysis event, then streamed tokens (SSE) |
 
 ### `POST /chat`
 

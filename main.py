@@ -1,11 +1,14 @@
+import json
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from groq import Groq
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+from graph import DEFAULT_ANALYSIS, analyse_query, build_graph, stream_answer
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
@@ -13,12 +16,6 @@ load_dotenv(ROOT.parent / "legal_assist" / ".env")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-SYSTEM_PROMPT = (
-    "You are a legal AI assistant. Give clear, practical answers. "
-    "You are not a lawyer and this is not formal legal advice."
-)
 
 app = FastAPI(title="Legal AI Assistant")
 
@@ -54,6 +51,28 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     model: str
+    analysis: dict
+
+
+def require_key() -> str:
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured")
+    return GROQ_API_KEY
+
+
+def cleaned_messages(req: ChatRequest) -> list[dict[str, str]]:
+    messages = [
+        {"role": item.role, "content": item.content.strip()}
+        for item in req.messages
+        if item.content.strip()
+    ]
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages cannot be empty")
+    return messages
+
+
+def sse(event: dict) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
 @app.get("/")
@@ -68,35 +87,63 @@ def health():
         "provider": "groq",
         "model": GROQ_MODEL,
         "configured": bool(GROQ_API_KEY),
+        "stack": {
+            "langchain": True,
+            "langgraph": True,
+            "streaming": True,
+            "query_analyser": True,
+        },
     }
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    if client is None:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured")
-
-    if not req.messages:
-        raise HTTPException(status_code=400, detail="messages cannot be empty")
-
-    payload = [{"role": "system", "content": SYSTEM_PROMPT}] + [
-        {"role": m.role, "content": m.content.strip()}
-        for m in req.messages
-        if m.content.strip()
-    ]
-
+    api_key = require_key()
+    messages = cleaned_messages(req)
     try:
-        completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=payload,
-            temperature=0.4,
-            max_tokens=1024,
+        result = build_graph(api_key, GROQ_MODEL).invoke(
+            {"messages": messages, "analysis": None, "reply": ""}
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Groq error: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"LangGraph error: {exc}") from exc
 
-    reply = (completion.choices[0].message.content or "").strip()
+    reply = (result.get("reply") or "").strip()
     if not reply:
         raise HTTPException(status_code=502, detail="Groq returned an empty reply")
 
-    return ChatResponse(reply=reply, model=GROQ_MODEL)
+    return ChatResponse(
+        reply=reply,
+        model=GROQ_MODEL,
+        analysis=result.get("analysis") or DEFAULT_ANALYSIS,
+    )
+
+
+@app.post("/chat/stream")
+def chat_stream(req: ChatRequest):
+    api_key = require_key()
+    messages = cleaned_messages(req)
+
+    def generate():
+        try:
+            analysis = analyse_query(messages, api_key, GROQ_MODEL)
+            yield sse({"type": "analysis", "analysis": analysis, "model": GROQ_MODEL})
+            reply_parts: list[str] = []
+            for token in stream_answer(messages, analysis, api_key, GROQ_MODEL):
+                reply_parts.append(token)
+                yield sse({"type": "token", "content": token})
+            if not "".join(reply_parts).strip():
+                yield sse({"type": "error", "detail": "Groq returned an empty reply"})
+                return
+            yield sse({"type": "done", "model": GROQ_MODEL})
+        except Exception as exc:
+            yield sse({"type": "error", "detail": f"LangGraph error: {exc}"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
