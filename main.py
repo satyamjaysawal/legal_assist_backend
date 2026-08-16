@@ -1,8 +1,10 @@
 import json
 import os
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -19,12 +21,14 @@ from graph import (
 )
 from journeys import create_journey, get_journey, list_journeys, rename_journey
 from cache import get_prompt_cache, set_prompt_cache
-from docs import chunk_text, parse_file
+from docs import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, chunk_text, parse_file
 from embeddings import embed_status
+from files import files_status, get_original_file, store_original_file
 from memory import layer_status, list_user_facts, load_all, save_all
 from vectordb import (
     delete_doc,
     format_hits,
+    get_doc,
     hits_fingerprint,
     ingest_document,
     list_docs,
@@ -141,10 +145,13 @@ def health():
             "rag": True,
             "uploads": ["pdf", "docx", "text", "image"],
             "embed_model": os.getenv("GROQ_EMBED_MODEL", "nomic-embed-text-v1.5"),
+            "file_store": "mongodb_gridfs",
+            "max_upload_mb": MAX_UPLOAD_MB,
         },
         "memory": layer_status(),
         "qdrant": qdrant_status(),
         "embeddings": embed_status(),
+        "files": files_status(),
     }
 
 
@@ -208,6 +215,7 @@ def memory_detail(journey_id: str = "", user: dict = Depends(current_user)):
         "documents": list_docs(user["user_id"], journey_id) if journey_id else list_docs(user["user_id"]),
         "qdrant": qdrant_status(),
         "embeddings": embed_status(),
+        "files": files_status(),
     }
 
 
@@ -218,23 +226,96 @@ async def documents_upload(
     user: dict = Depends(current_user),
 ):
     journey = resolve_journey(user, journey_id)
+    filename = file.filename or "upload"
+    content_type = file.content_type or ""
     data = await file.read()
-    try:
-        parsed = parse_file(file.filename or "upload", file.content_type or "", data)
-        chunks = chunk_text(parsed["text"])
-        if not chunks:
-            raise ValueError("No chunks produced from file")
-        stored = ingest_document(user["user_id"], journey["journey_id"], parsed, chunks)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Could not ingest file: {exc}") from exc
-    return {
-        "ok": True,
-        "journey_id": journey["journey_id"],
-        "document": stored,
-        "qdrant": qdrant_status(),
-    }
+    user_id = user["user_id"]
+    journey_id = journey["journey_id"]
+
+    def generate():
+        flow = []
+
+        def step(name, status, detail=""):
+            item = {"name": name, "status": status, "detail": detail}
+            flow.append(item)
+            return sse({"type": "flow", "steps": flow[:], "current": name})
+
+        try:
+            yield sse({"type": "thinking", "text": f"Received {filename}…"})
+            yield sse(
+                {
+                    "type": "file",
+                    "filename": filename,
+                    "bytes": len(data),
+                    "content_type": content_type,
+                    "max_bytes": MAX_UPLOAD_BYTES,
+                }
+            )
+            yield step("receive", "done", f"{filename} · {len(data)} bytes")
+
+            yield sse({"type": "thinking", "text": f"Checking size (max {MAX_UPLOAD_MB} MB)…"})
+            if len(data) > MAX_UPLOAD_BYTES:
+                yield step("validate", "error", f"Larger than {MAX_UPLOAD_MB} MB")
+                yield sse({"type": "error", "detail": f"File is larger than {MAX_UPLOAD_MB} MB"})
+                return
+            yield step("validate", "done", f"Within {MAX_UPLOAD_MB} MB · {content_type or 'unknown type'}")
+
+            yield sse({"type": "thinking", "text": f"Parsing {filename}…"})
+            yield step("parse", "running", "Extracting text")
+            parsed = parse_file(filename, content_type, data)
+            yield step("parse", "done", f"{parsed['kind']} · {parsed['chars']} characters")
+
+            yield sse({"type": "thinking", "text": "Splitting into chunks…"})
+            chunks = chunk_text(parsed["text"])
+            if not chunks:
+                yield step("chunk", "error", "No text chunks")
+                yield sse({"type": "error", "detail": "No chunks produced from file"})
+                return
+            yield step("chunk", "done", f"{len(chunks)} chunk(s)")
+
+            doc_id = str(uuid.uuid4())
+            yield sse({"type": "thinking", "text": "Uploading original file to MongoDB…"})
+            yield step("mongodb", "running", "GridFS write")
+            file_meta = store_original_file(
+                user_id=user_id,
+                journey_id=journey_id,
+                doc_id=doc_id,
+                filename=filename,
+                content_type=content_type,
+                data=data,
+            )
+            yield step("mongodb", "done", file_meta["detail"])
+            yield sse({"type": "mongo", "report": file_meta})
+
+            yield sse({"type": "thinking", "text": "Embedding chunks…"})
+            yield step("embed", "running", "nomic-embed-text-v1.5 / fallback")
+            stored = ingest_document(
+                user_id,
+                journey_id,
+                parsed,
+                chunks,
+                doc_id=doc_id,
+                file_meta=file_meta,
+            )
+            yield step("embed", "done", f"{stored.get('embed_provider') or stored.get('embed_model')} · {stored['chunks']} vector(s)")
+            yield step("qdrant", "done", f"Indexed in {stored.get('collection') or 'Qdrant'}")
+            yield sse({"type": "document", "document": stored, "journey_id": journey_id})
+            yield sse({"type": "thinking", "text": "File stored in MongoDB and indexed."})
+            yield sse({"type": "done", "document": stored, "journey_id": journey_id})
+        except ValueError as exc:
+            yield sse({"type": "error", "detail": str(exc)})
+        except Exception as exc:
+            yield sse({"type": "error", "detail": f"Could not ingest file: {exc}"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/documents")
@@ -243,7 +324,28 @@ def documents_list(journey_id: str = "", user: dict = Depends(current_user)):
         "documents": list_docs(user["user_id"], journey_id),
         "qdrant": qdrant_status(),
         "embeddings": embed_status(),
+        "files": files_status(),
+        "max_upload_mb": MAX_UPLOAD_MB,
     }
+
+
+@app.get("/documents/{doc_id}/file")
+def documents_download(doc_id: str, user: dict = Depends(current_user)):
+    meta = get_doc(user["user_id"], doc_id)
+    if not meta or not meta.get("gridfs_id"):
+        raise HTTPException(status_code=404, detail="Original file is not stored")
+    try:
+        grid_out, file_meta = get_original_file(user["user_id"], meta["gridfs_id"])
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    filename = file_meta["filename"].replace('"', "")
+    return StreamingResponse(
+        grid_out,
+        media_type=file_meta["content_type"],
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.delete("/documents/{doc_id}")

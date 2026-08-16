@@ -13,7 +13,8 @@ load_dotenv(Path(__file__).resolve().parent.parent / "legal_assist" / ".env")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(4 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(5 * 1024 * 1024)))
+MAX_UPLOAD_MB = max(1, round(MAX_UPLOAD_BYTES / (1024 * 1024)))
 CHUNK_SIZE = int(os.getenv("DOC_CHUNK_SIZE", "900"))
 CHUNK_OVERLAP = int(os.getenv("DOC_CHUNK_OVERLAP", "150"))
 
@@ -143,7 +144,7 @@ def parse_file(filename: str, content_type: str, data: bytes) -> dict[str, Any]:
     if not data:
         raise ValueError("Empty file")
     if len(data) > MAX_UPLOAD_BYTES:
-        raise ValueError(f"File is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+        raise ValueError(f"File is larger than {MAX_UPLOAD_MB} MB")
     kind = detect_kind(filename, content_type)
     if kind == "pdf":
         text = parse_pdf(data)

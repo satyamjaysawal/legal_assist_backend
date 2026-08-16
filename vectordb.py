@@ -23,6 +23,7 @@ from qdrant_client.models import (
 )
 
 from embeddings import EMBED_DIM, GROQ_EMBED_MODEL, embed_texts
+from files import delete_original_file
 from memory import MONGO_DB, get_mongo
 
 QDRANT_URL = os.getenv("QUDRANT_CLUSTER_ENDPOINT") or os.getenv("QDRANT_URL") or ""
@@ -137,20 +138,31 @@ def list_docs(user_id: str, journey_id: str = "") -> list[dict[str, Any]]:
     return rows
 
 
+def get_doc(user_id: str, doc_id: str) -> dict[str, Any] | None:
+    col = _docs_col()
+    if col is None:
+        return None
+    return col.find_one({"user_id": user_id, "doc_id": doc_id}, {"_id": 0})
+
+
 def delete_doc(user_id: str, doc_id: str) -> dict[str, Any]:
-    client = ensure_collection()
+    meta = get_doc(user_id, doc_id) or {}
+    if meta.get("gridfs_id"):
+        delete_original_file(str(meta["gridfs_id"]))
+    client = get_qdrant()
     selector = Filter(
         must=[
             FieldCondition(key="user_id", match=MatchValue(value=user_id)),
             FieldCondition(key="doc_id", match=MatchValue(value=doc_id)),
         ]
     )
-    for name in (COLLECTION, CLOUD_COLLECTION):
-        try:
-            if client.collection_exists(name):
-                client.delete(collection_name=name, points_selector=selector)
-        except Exception:
-            pass
+    if client is not None:
+        for name in (COLLECTION, CLOUD_COLLECTION):
+            try:
+                if client.collection_exists(name):
+                    client.delete(collection_name=name, points_selector=selector)
+            except Exception:
+                pass
     col = _docs_col()
     if col is not None:
         col.delete_one({"user_id": user_id, "doc_id": doc_id})
@@ -162,9 +174,12 @@ def ingest_document(
     journey_id: str,
     parsed: dict[str, Any],
     chunks: list[str],
+    doc_id: str = "",
+    file_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    doc_id = str(uuid.uuid4())
+    doc_id = doc_id or str(uuid.uuid4())
     created = _now()
+    file_meta = file_meta or {}
     embed_report: dict[str, Any]
     collection = COLLECTION
     try:
@@ -231,6 +246,9 @@ def ingest_document(
         "embed_model": embed_report.get("model") or GROQ_EMBED_MODEL,
         "embed_provider": embed_report.get("provider") or "",
         "collection": collection,
+        "gridfs_id": file_meta.get("gridfs_id") or "",
+        "file_store": file_meta.get("store") or "",
+        "stored_in": "mongodb_gridfs" if file_meta.get("gridfs_id") else "",
         "created_at": created,
     }
     save_doc_meta(meta)
