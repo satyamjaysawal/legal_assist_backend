@@ -13,11 +13,7 @@ load_dotenv(ROOT.parent / "legal_assist" / ".env")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
-if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY is missing. Set it in backend/.env")
-
-client = Groq(api_key=GROQ_API_KEY)
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 SYSTEM_PROMPT = (
     "You are a legal AI assistant. Give clear, practical answers. "
@@ -26,9 +22,20 @@ SYSTEM_PROMPT = (
 
 app = FastAPI(title="Legal AI Assistant")
 
+extra_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        *extra_origins,
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,13 +56,26 @@ class ChatResponse(BaseModel):
     model: str
 
 
+@app.get("/")
+def root():
+    return {"service": "legal_assist_backend", "ok": True}
+
+
 @app.get("/health")
 def health():
-    return {"ok": True, "provider": "groq", "model": GROQ_MODEL}
+    return {
+        "ok": True,
+        "provider": "groq",
+        "model": GROQ_MODEL,
+        "configured": bool(GROQ_API_KEY),
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
+    if client is None:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured")
+
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages cannot be empty")
 
