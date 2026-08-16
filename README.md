@@ -11,13 +11,13 @@ FastAPI chat API with **LangChain + LangGraph**, a **query analyser**, and **SSE
 
 | Service | URL |
 | --- | --- |
-| **Backend API** | https://legal-assist-graph.vercel.app |
-| **Health** | https://legal-assist-graph.vercel.app/health |
-| **Swagger docs** | https://legal-assist-graph.vercel.app/docs |
-| **Frontend** | https://legal-assist-ui.vercel.app |
+| **Backend API** | https://legal-assist-mem.vercel.app |
+| **Health** | https://legal-assist-mem.vercel.app/health |
+| **Swagger docs** | https://legal-assist-mem.vercel.app/docs |
+| **Frontend** | https://legal-assist-app.vercel.app |
 
 **GitHub:** https://github.com/satyamjaysawal/legal_assist_backend  
-**Vercel project:** `legal-assist-graph` under [satyam-jaysawals-projects](https://vercel.com/satyam-jaysawals-projects)
+**Vercel project:** `legal-assist-mem` under [satyam-jaysawals-projects](https://vercel.com/satyam-jaysawals-projects)
 
 ## Features
 
@@ -51,7 +51,7 @@ Copy `.env.example` → `.env` for local development. **Never commit real secret
 | --- | --- | --- |
 | `GROQ_API_KEY` | `gsk_...` | Groq API key ([console.groq.com](https://console.groq.com)) |
 | `GROQ_MODEL` | `llama-3.3-70b-versatile` | Chat model |
-| `CORS_ORIGINS` | `https://legal-assist-ui.vercel.app` | Extra allowed origins (comma-separated) |
+| `CORS_ORIGINS` | `https://legal-assist-app.vercel.app` | Extra allowed origins (comma-separated) |
 
 ## Local setup
 
