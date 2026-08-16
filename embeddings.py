@@ -1,4 +1,5 @@
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -7,6 +8,11 @@ from groq import Groq
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 load_dotenv(Path(__file__).resolve().parent.parent / "legal_assist" / ".env")
+
+_CACHE_DIR = os.getenv("FASTEMBED_CACHE_PATH") or os.path.join(tempfile.gettempdir(), "legal_assist_fastembed")
+os.environ.setdefault("FASTEMBED_CACHE_PATH", _CACHE_DIR)
+os.environ.setdefault("HF_HOME", os.path.join(_CACHE_DIR, "hf"))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(_CACHE_DIR, "hub"))
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_EMBED_MODEL = os.getenv("GROQ_EMBED_MODEL", "nomic-embed-text-v1.5")
@@ -54,7 +60,8 @@ def _fastembed_embed(texts: list[str]) -> list[list[float]]:
     if _fastembed is None:
         from fastembed import TextEmbedding
 
-        _fastembed = TextEmbedding(model_name=FASTEMBED_MODEL)
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        _fastembed = TextEmbedding(model_name=FASTEMBED_MODEL, cache_dir=_CACHE_DIR)
     return [vec.tolist() for vec in _fastembed.embed(texts)]
 
 
