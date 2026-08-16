@@ -1,15 +1,16 @@
 import json
 import os
 from pathlib import Path
-from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from auth import current_user, login_user, make_token, register_user, update_user
 from graph import DEFAULT_ANALYSIS, build_graph, latest_user_text, stream_graph
+from journeys import create_journey, get_journey, list_journeys
 from memory import layer_status, load_all, save_all
 
 ROOT = Path(__file__).resolve().parent
@@ -41,6 +42,20 @@ app.add_middleware(
 )
 
 
+class AuthPayload(BaseModel):
+    email: str
+    password: str
+    name: str = ""
+
+
+class ProfileUpdate(BaseModel):
+    name: str
+
+
+class JourneyCreate(BaseModel):
+    title: str = ""
+
+
 class ChatMessage(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
     content: str
@@ -48,17 +63,8 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
+    journey_id: str = ""
     session_id: str = ""
-    user_id: str = ""
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    model: str
-    analysis: dict
-    session_id: str
-    user_id: str
-    memory: dict
 
 
 def require_key() -> str:
@@ -78,10 +84,11 @@ def cleaned_messages(req: ChatRequest) -> list[dict[str, str]]:
     return messages
 
 
-def ids_from(req: ChatRequest) -> tuple[str, str]:
-    session_id = (req.session_id or "").strip() or str(uuid4())
-    user_id = (req.user_id or "").strip() or session_id
-    return session_id, user_id
+def resolve_journey(user: dict, journey_id: str) -> dict:
+    journey_id = (journey_id or "").strip()
+    if journey_id:
+        return get_journey(user["user_id"], journey_id)
+    return create_journey(user["user_id"])
 
 
 def sse(event: dict) -> str:
@@ -104,77 +111,79 @@ def health():
             "langchain": True,
             "langgraph": True,
             "streaming": "langgraph.stream",
-            "stream_mode": ["updates", "messages"],
-            "stream_version": "v2",
             "query_analyser": True,
-            "memory": ["in_memory", "short_term_redis", "long_term_mongodb"],
+            "auth": "mongodb",
+            "memory": ["in_memory", "short_term_redis", "user_thread_mongo", "long_term_mongodb"],
         },
         "memory": layer_status(),
     }
 
 
-@app.get("/session/{session_id}")
-def get_session(session_id: str, user_id: str = ""):
-    loaded = load_all(session_id, user_id or session_id, [], "")
-    return {
-        "session_id": session_id,
-        "user_id": user_id or session_id,
-        "messages": loaded["history"],
-        "memory": {"layers": loaded["layers"], "facts": loaded["facts"]},
-    }
+@app.post("/auth/register")
+def auth_register(payload: AuthPayload):
+    user = register_user(payload.email, payload.password, payload.name)
+    token = make_token(user["user_id"], user["email"])
+    journey = create_journey(user["user_id"], "First thread")
+    return {"token": token, "user": user, "journey": journey}
 
 
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    api_key = require_key()
-    incoming = cleaned_messages(req)
-    session_id, user_id = ids_from(req)
-    query = latest_user_text(incoming)
-    loaded = load_all(session_id, user_id, incoming, query)
-    try:
-        result = build_graph(api_key, GROQ_MODEL).invoke(
-            {
-                "messages": loaded["history"],
-                "analysis": None,
-                "reply": "",
-                "memory_notes": loaded["notes"],
-            }
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"LangGraph error: {exc}") from exc
+@app.post("/auth/login")
+def auth_login(payload: AuthPayload):
+    user = login_user(payload.email, payload.password)
+    token = make_token(user["user_id"], user["email"])
+    journeys = list_journeys(user["user_id"])
+    journey = journeys[0] if journeys else create_journey(user["user_id"], "First thread")
+    return {"token": token, "user": user, "journey": journey, "journeys": journeys or [journey]}
 
-    reply = (result.get("reply") or "").strip()
-    if not reply:
-        raise HTTPException(status_code=502, detail="Groq returned an empty reply")
 
-    analysis = result.get("analysis") or DEFAULT_ANALYSIS
-    stored = loaded["history"] + [{"role": "assistant", "content": reply}]
-    writes = save_all(session_id, user_id, stored, query, reply, analysis)
-    return ChatResponse(
-        reply=reply,
-        model=GROQ_MODEL,
-        analysis=analysis,
-        session_id=session_id,
-        user_id=user_id,
-        memory={"layers": loaded["layers"], "writes": writes, "facts": loaded["facts"]},
-    )
+@app.get("/auth/me")
+def auth_me(user: dict = Depends(current_user)):
+    journeys = list_journeys(user["user_id"])
+    return {"user": user, "journeys": journeys, "journey_count": len(journeys)}
+
+
+@app.patch("/auth/me")
+def auth_update(payload: ProfileUpdate, user: dict = Depends(current_user)):
+    return {"user": update_user(user["user_id"], payload.name)}
+
+
+@app.get("/journeys")
+def journeys_list(user: dict = Depends(current_user)):
+    return {"journeys": list_journeys(user["user_id"])}
+
+
+@app.post("/journeys")
+def journeys_create(payload: JourneyCreate, user: dict = Depends(current_user)):
+    return create_journey(user["user_id"], payload.title)
+
+
+@app.get("/journeys/{journey_id}")
+def journeys_get(journey_id: str, user: dict = Depends(current_user)):
+    journey = get_journey(user["user_id"], journey_id)
+    loaded = load_all(user["user_id"], journey_id, journey.get("messages") or [], "")
+    journey["messages"] = loaded["history"]
+    journey["memory"] = {"layers": loaded["layers"], "facts": loaded["facts"]}
+    return journey
 
 
 @app.post("/chat/stream")
-def chat_stream(req: ChatRequest):
+def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
     api_key = require_key()
     incoming = cleaned_messages(req)
-    session_id, user_id = ids_from(req)
+    journey = resolve_journey(user, req.journey_id or req.session_id)
+    journey_id = journey["journey_id"]
+    user_id = user["user_id"]
     query = latest_user_text(incoming)
-    loaded = load_all(session_id, user_id, incoming, query)
+    loaded = load_all(user_id, journey_id, incoming, query)
 
     def generate():
         try:
             yield sse(
                 {
                     "type": "memory",
-                    "session_id": session_id,
                     "user_id": user_id,
+                    "journey_id": journey_id,
+                    "session_id": journey_id,
                     "layers": loaded["layers"],
                     "facts": loaded["facts"],
                 }
@@ -195,8 +204,15 @@ def chat_stream(req: ChatRequest):
             reply = "".join(reply_parts).strip()
             if reply:
                 stored = loaded["history"] + [{"role": "assistant", "content": reply}]
-                writes = save_all(session_id, user_id, stored, query, reply, analysis)
-                yield sse({"type": "memory_write", "writes": writes})
+                writes = save_all(journey_id, user_id, stored, query, reply, analysis)
+                yield sse(
+                    {
+                        "type": "memory_write",
+                        "writes": writes,
+                        "journey_id": journey_id,
+                        "session_id": journey_id,
+                    }
+                )
         except Exception as exc:
             yield sse({"type": "error", "detail": f"LangGraph error: {exc}"})
 
@@ -209,3 +225,40 @@ def chat_stream(req: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/chat")
+def chat(req: ChatRequest, user: dict = Depends(current_user)):
+    api_key = require_key()
+    incoming = cleaned_messages(req)
+    journey = resolve_journey(user, req.journey_id or req.session_id)
+    journey_id = journey["journey_id"]
+    user_id = user["user_id"]
+    query = latest_user_text(incoming)
+    loaded = load_all(user_id, journey_id, incoming, query)
+    try:
+        result = build_graph(api_key, GROQ_MODEL).invoke(
+            {
+                "messages": loaded["history"],
+                "analysis": None,
+                "reply": "",
+                "memory_notes": loaded["notes"],
+            }
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LangGraph error: {exc}") from exc
+    reply = (result.get("reply") or "").strip()
+    if not reply:
+        raise HTTPException(status_code=502, detail="Groq returned an empty reply")
+    analysis = result.get("analysis") or DEFAULT_ANALYSIS
+    stored = loaded["history"] + [{"role": "assistant", "content": reply}]
+    writes = save_all(journey_id, user_id, stored, query, reply, analysis)
+    return {
+        "reply": reply,
+        "model": GROQ_MODEL,
+        "analysis": analysis,
+        "journey_id": journey_id,
+        "session_id": journey_id,
+        "user_id": user_id,
+        "memory": {"layers": loaded["layers"], "writes": writes, "facts": loaded["facts"]},
+    }

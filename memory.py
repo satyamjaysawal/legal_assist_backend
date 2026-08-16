@@ -76,8 +76,12 @@ def get_mongo():
         return None
 
 
-def stm_key(session_id: str) -> str:
-    return f"legal_assist:stm:{session_id}"
+def stm_key(user_id: str, journey_id: str) -> str:
+    return f"legal_assist:stm:{user_id}:{journey_id}"
+
+
+def cache_key(user_id: str, journey_id: str) -> str:
+    return f"{user_id}:{journey_id}"
 
 
 def layer_status() -> dict[str, Any]:
@@ -116,8 +120,8 @@ def layer_status() -> dict[str, Any]:
     }
 
 
-def load_in_memory(session_id: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    turns = _in_memory.get(session_id) or []
+def load_in_memory(user_id: str, journey_id: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    turns = _in_memory.get(cache_key(user_id, journey_id)) or []
     return turns, {
         "name": "in_memory",
         "label": "In-memory",
@@ -126,11 +130,11 @@ def load_in_memory(session_id: str) -> tuple[list[dict[str, str]], dict[str, Any
         "status": "hit" if turns else "miss",
         "when": _now(),
         "turns": len(turns),
-        "detail": f"{len(turns)} cached turn(s) in this process" if turns else "No process cache for this session",
+        "detail": f"{len(turns)} cached turn(s) for this journey" if turns else "No process cache for this journey",
     }
 
 
-def load_short_term(session_id: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
+def load_short_term(user_id: str, journey_id: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
     client = get_redis()
     report = {
         "name": "short_term",
@@ -141,7 +145,7 @@ def load_short_term(session_id: str) -> tuple[list[dict[str, str]], dict[str, An
         "when": _now(),
         "turns": 0,
         "ttl_seconds": None,
-        "key": stm_key(session_id),
+        "key": stm_key(user_id, journey_id),
         "detail": "Redis miss",
     }
     if client is None:
@@ -149,8 +153,8 @@ def load_short_term(session_id: str) -> tuple[list[dict[str, str]], dict[str, An
         report["detail"] = _redis_error or "Redis unavailable"
         return [], report
     try:
-        raw = client.get(stm_key(session_id))
-        ttl = client.ttl(stm_key(session_id))
+        raw = client.get(stm_key(user_id, journey_id))
+        ttl = client.ttl(stm_key(user_id, journey_id))
         report["ttl_seconds"] = ttl if isinstance(ttl, int) and ttl >= 0 else None
         if not raw:
             report["detail"] = "No Redis session window"
@@ -194,7 +198,9 @@ def load_long_term(user_id: str, query: str) -> tuple[list[dict[str, Any]], dict
         return [], report
     try:
         col = client[MONGO_DB][LTM_COLLECTION]
-        docs = list(col.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).limit(40))
+        docs = list(
+            col.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).limit(40)
+        )
         words = [w.lower() for w in re.findall(r"[a-zA-Z]{3,}", query or "")]
         scored: list[dict[str, Any]] = []
         for doc in docs:
@@ -239,11 +245,44 @@ def merge_history(*histories: list[dict[str, str]]) -> list[dict[str, str]]:
     return longest
 
 
-def load_all(session_id: str, user_id: str, incoming: list[dict[str, str]], query: str):
-    inmem, inmem_report = load_in_memory(session_id)
-    stm, stm_report = load_short_term(session_id)
+def load_thread(user_id: str, journey_id: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    report = {
+        "name": "thread",
+        "label": "User thread",
+        "store": "MongoDB journeys",
+        "used": False,
+        "status": "miss",
+        "when": _now(),
+        "turns": 0,
+        "journey_id": journey_id,
+        "detail": "No saved thread",
+    }
+    try:
+        from journeys import load_journey_messages
+
+        turns = load_journey_messages(user_id, journey_id)
+        report["used"] = bool(turns)
+        report["status"] = "hit" if turns else "miss"
+        report["turns"] = len(turns)
+        report["detail"] = f"{len(turns)} message(s) in journey {journey_id[:8]}"
+        return turns, report
+    except Exception as exc:
+        report["status"] = "error"
+        report["detail"] = str(exc)
+        return [], report
+
+
+def load_all(
+    user_id: str,
+    journey_id: str,
+    incoming: list[dict[str, str]],
+    query: str,
+):
+    inmem, inmem_report = load_in_memory(user_id, journey_id)
+    stm, stm_report = load_short_term(user_id, journey_id)
+    thread, thread_report = load_thread(user_id, journey_id)
     facts, ltm_report = load_long_term(user_id, query)
-    history = merge_history(inmem, stm, incoming)
+    history = merge_history(inmem, stm, thread, incoming)
     notes = ""
     if facts:
         notes = "\n".join(
@@ -255,24 +294,25 @@ def load_all(session_id: str, user_id: str, incoming: list[dict[str, str]], quer
         "history": history,
         "facts": facts,
         "notes": notes,
-        "layers": [inmem_report, stm_report, ltm_report],
+        "layers": [inmem_report, stm_report, thread_report, ltm_report],
     }
 
 
-def save_in_memory(session_id: str, messages: list[dict[str, str]]) -> dict[str, Any]:
-    _in_memory[session_id] = messages[-STM_WINDOW:]
+def save_in_memory(user_id: str, journey_id: str, messages: list[dict[str, str]]) -> dict[str, Any]:
+    key = cache_key(user_id, journey_id)
+    _in_memory[key] = messages[-STM_WINDOW:]
     return {
         "name": "in_memory",
         "label": "In-memory",
         "store": "process RAM",
         "wrote": True,
         "when": _now(),
-        "turns": len(_in_memory[session_id]),
+        "turns": len(_in_memory[key]),
         "detail": "Wrote working set to process cache",
     }
 
 
-def save_short_term(session_id: str, messages: list[dict[str, str]]) -> dict[str, Any]:
+def save_short_term(user_id: str, journey_id: str, messages: list[dict[str, str]]) -> dict[str, Any]:
     report = {
         "name": "short_term",
         "label": "Short-term",
@@ -288,7 +328,7 @@ def save_short_term(session_id: str, messages: list[dict[str, str]]) -> dict[str
         return report
     try:
         window = messages[-STM_WINDOW:]
-        client.setex(stm_key(session_id), STM_TTL_SECONDS, json.dumps(window))
+        client.setex(stm_key(user_id, journey_id), STM_TTL_SECONDS, json.dumps(window))
         report["wrote"] = True
         report["turns"] = len(window)
         report["detail"] = f"Saved {len(window)} message(s), TTL {STM_TTL_SECONDS}s"
@@ -325,6 +365,7 @@ def save_long_term(
         analysis = analysis or {}
         doc = {
             "user_id": user_id,
+            "journey_id": session_id,
             "session_id": session_id,
             "kind": "turn",
             "query": query[:500],
@@ -343,8 +384,31 @@ def save_long_term(
         return report
 
 
+def save_thread(user_id: str, journey_id: str, messages: list[dict[str, str]], query: str):
+    report = {
+        "name": "thread",
+        "label": "User thread",
+        "store": "MongoDB journeys",
+        "wrote": False,
+        "when": _now(),
+        "journey_id": journey_id,
+        "detail": "Thread write skipped",
+    }
+    try:
+        from journeys import save_journey_thread
+
+        saved = save_journey_thread(user_id, journey_id, messages, title_hint=query)
+        report["wrote"] = bool(saved.get("wrote"))
+        report["turns"] = saved.get("turns", 0)
+        report["detail"] = f"Saved thread {journey_id[:8]} ({saved.get('turns', 0)} msgs)"
+        return report
+    except Exception as exc:
+        report["detail"] = str(exc)
+        return report
+
+
 def save_all(
-    session_id: str,
+    journey_id: str,
     user_id: str,
     messages: list[dict[str, str]],
     query: str,
@@ -352,7 +416,8 @@ def save_all(
     analysis: dict[str, Any] | None,
 ):
     return [
-        save_in_memory(session_id, messages),
-        save_short_term(session_id, messages),
-        save_long_term(user_id, session_id, query, reply, analysis),
+        save_in_memory(user_id, journey_id, messages),
+        save_short_term(user_id, journey_id, messages),
+        save_thread(user_id, journey_id, messages, query),
+        save_long_term(user_id, journey_id, query, reply, analysis),
     ]
