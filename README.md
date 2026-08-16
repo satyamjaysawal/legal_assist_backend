@@ -11,13 +11,13 @@ FastAPI chat API with **LangChain + LangGraph**, a **query analyser**, and **SSE
 
 | Service | URL |
 | --- | --- |
-| **Backend API** | https://legal-assist-mem.vercel.app |
-| **Health** | https://legal-assist-mem.vercel.app/health |
-| **Swagger docs** | https://legal-assist-mem.vercel.app/docs |
-| **Frontend** | https://legal-assist-app.vercel.app |
+| **Backend API** | https://legal-assist-auth.vercel.app |
+| **Health** | https://legal-assist-auth.vercel.app/health |
+| **Swagger docs** | https://legal-assist-auth.vercel.app/docs |
+| **Frontend** | https://legal-assist-web-seven.vercel.app |
 
 **GitHub:** https://github.com/satyamjaysawal/legal_assist_backend  
-**Vercel project:** `legal-assist-mem` under [satyam-jaysawals-projects](https://vercel.com/satyam-jaysawals-projects)
+**Vercel project:** `legal-assist-auth` under [satyam-jaysawals-projects](https://vercel.com/satyam-jaysawals-projects)
 
 ## Features
 
