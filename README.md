@@ -28,6 +28,7 @@ FastAPI chat API with **LangChain + LangGraph**, a **query analyser**, and **SSE
 - `POST /chat` — same graph, full JSON reply (`graph.invoke`)
 - `GET /health` — model + stack flags (no secrets)
 - Groq key stays server-side (`GROQ_API_KEY`)
+- Memory: in-process cache, Redis short-term session, MongoDB `legal_assist_inhouse` long-term facts
 
 ## File structure
 

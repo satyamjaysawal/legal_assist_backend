@@ -6,3 +6,5 @@ pydantic>=2.10.0
 langchain-core>=0.3.0
 langchain-groq>=0.2.0
 langgraph>=0.2.0
+redis>=5.0.0
+pymongo>=4.9.0

@@ -48,6 +48,7 @@ class AgentState(TypedDict):
     messages: list[dict[str, str]]
     analysis: Optional[QueryAnalysis]
     reply: str
+    memory_notes: str
 
 
 DEFAULT_ANALYSIS: QueryAnalysis = {
@@ -165,8 +166,12 @@ def build_graph(api_key: str, model: str):
 
     def generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         analysis = state.get("analysis") or DEFAULT_ANALYSIS
+        extra = analysis_context(analysis)
+        notes = (state.get("memory_notes") or "").strip()
+        if notes:
+            extra += "\n\nLong-term memory about this user (MongoDB):\n" + notes
         result = writer.invoke(
-            to_lc_messages(state["messages"], ANSWER_PROMPT + analysis_context(analysis)),
+            to_lc_messages(state["messages"], ANSWER_PROMPT + extra),
             config=config,
         )
         return {"reply": str(result.content or "").strip()}
@@ -184,6 +189,7 @@ def stream_graph(
     messages: list[dict[str, str]],
     api_key: str,
     model: str,
+    memory_notes: str = "",
 ) -> Iterator[dict[str, Any]]:
     """Yield app events from LangGraph `stream(version='v2')`.
 
@@ -195,7 +201,12 @@ def stream_graph(
     reply_parts: list[str] = []
 
     for part in compiled.stream(
-        {"messages": messages, "analysis": None, "reply": ""},
+        {
+            "messages": messages,
+            "analysis": None,
+            "reply": "",
+            "memory_notes": memory_notes,
+        },
         stream_mode=["updates", "messages"],
         version="v2",
     ):
