@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+from fastapi import HTTPException
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 load_dotenv(Path(__file__).resolve().parent.parent / "legal_assist" / ".env")
@@ -145,8 +146,32 @@ def get_doc(user_id: str, doc_id: str) -> dict[str, Any] | None:
     return col.find_one({"user_id": user_id, "doc_id": doc_id}, {"_id": 0})
 
 
+def delete_docs_for_journey(user_id: str, journey_id: str) -> int:
+    docs = list_docs(user_id, journey_id)
+    for doc in docs:
+        if doc.get("doc_id"):
+            delete_doc(user_id, doc["doc_id"])
+    client = get_qdrant()
+    if client is not None:
+        selector = Filter(
+            must=[
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="journey_id", match=MatchValue(value=journey_id)),
+            ]
+        )
+        for name in (COLLECTION, CLOUD_COLLECTION):
+            try:
+                if client.collection_exists(name):
+                    client.delete(collection_name=name, points_selector=selector)
+            except Exception:
+                pass
+    return len(docs)
+
+
 def delete_doc(user_id: str, doc_id: str) -> dict[str, Any]:
-    meta = get_doc(user_id, doc_id) or {}
+    meta = get_doc(user_id, doc_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Document not found")
     if meta.get("gridfs_id"):
         delete_original_file(str(meta["gridfs_id"]))
     client = get_qdrant()

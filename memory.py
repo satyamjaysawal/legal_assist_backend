@@ -334,6 +334,30 @@ def load_all(
     }
 
 
+def clear_journey_memory(user_id: str, journey_id: str) -> dict[str, Any]:
+    key = cache_key(user_id, journey_id)
+    _in_memory.pop(key, None)
+    redis_ok = False
+    mongo_ok = False
+    client = get_redis()
+    if client is not None:
+        try:
+            client.delete(stm_key(user_id, journey_id))
+            redis_ok = True
+        except Exception:
+            redis_ok = False
+    mongo = get_mongo()
+    if mongo is not None:
+        try:
+            mongo[MONGO_DB][LTM_COLLECTION].delete_many(
+                {"user_id": user_id, "$or": [{"journey_id": journey_id}, {"session_id": journey_id}]}
+            )
+            mongo_ok = True
+        except Exception:
+            mongo_ok = False
+    return {"in_memory": True, "short_term": redis_ok, "long_term": mongo_ok}
+
+
 def save_in_memory(user_id: str, journey_id: str, messages: list[dict[str, str]]) -> dict[str, Any]:
     key = cache_key(user_id, journey_id)
     _in_memory[key] = messages[-STM_WINDOW:]

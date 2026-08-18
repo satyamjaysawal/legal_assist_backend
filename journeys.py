@@ -116,6 +116,32 @@ def rename_journey(user_id: str, journey_id: str, title: str) -> dict[str, Any]:
     return get_journey(user_id, journey_id)
 
 
+def delete_journey(user_id: str, journey_id: str) -> dict[str, Any]:
+    col = journeys_col()
+    doc = col.find_one({"user_id": user_id, "journey_id": journey_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Journey not found")
+    cleaned = {"docs": 0, "memory": {}}
+    try:
+        from memory import clear_journey_memory
+        from vectordb import delete_docs_for_journey
+
+        cleaned["docs"] = delete_docs_for_journey(user_id, journey_id)
+        cleaned["memory"] = clear_journey_memory(user_id, journey_id)
+    except Exception:
+        pass
+    col.delete_one({"user_id": user_id, "journey_id": journey_id})
+    remaining = list_journeys(user_id)
+    next_journey = remaining[0] if remaining else create_journey(user_id, "New chat")
+    return {
+        "ok": True,
+        "deleted": journey_id,
+        "cleaned": cleaned,
+        "journey": next_journey,
+        "journeys": remaining if remaining else [next_journey],
+    }
+
+
 def load_journey_messages(user_id: str, journey_id: str) -> list[dict[str, str]]:
     col = journeys_col()
     doc = col.find_one({"user_id": user_id, "journey_id": journey_id})
