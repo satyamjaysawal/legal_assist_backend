@@ -19,7 +19,7 @@ from graph import (
     suggest_followups,
     suggest_title,
 )
-from journeys import create_journey, delete_journey, get_journey, list_journeys, rename_journey
+from journeys import create_journey, delete_all_journeys, delete_journey, get_journey, list_journeys, rename_journey
 from cache import get_prompt_cache, set_prompt_cache
 from docs import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, chunk_text, parse_file
 from embeddings import embed_status
@@ -196,6 +196,11 @@ def journeys_create(payload: JourneyCreate, user: dict = Depends(current_user)):
 @app.patch("/journeys/{journey_id}")
 def journeys_rename(journey_id: str, payload: JourneyRename, user: dict = Depends(current_user)):
     return rename_journey(user["user_id"], journey_id, payload.title)
+
+
+@app.delete("/journeys")
+def journeys_delete_all(user: dict = Depends(current_user)):
+    return delete_all_journeys(user["user_id"])
 
 
 @app.delete("/journeys/{journey_id}")

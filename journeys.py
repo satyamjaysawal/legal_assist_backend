@@ -142,6 +142,36 @@ def delete_journey(user_id: str, journey_id: str) -> dict[str, Any]:
     }
 
 
+def delete_all_journeys(user_id: str) -> dict[str, Any]:
+    """Delete every chat and its associated document/vector/memory data."""
+    col = journeys_col()
+    existing = list(col.find({"user_id": user_id}, {"journey_id": 1}))
+    journey_ids = [item.get("journey_id") for item in existing if item.get("journey_id")]
+    cleaned_docs = 0
+    cleaned_memory = 0
+    try:
+        from memory import clear_journey_memory
+        from vectordb import delete_docs_for_journey
+
+        for journey_id in journey_ids:
+            try:
+                cleaned_docs += delete_docs_for_journey(user_id, journey_id)
+            finally:
+                memory_result = clear_journey_memory(user_id, journey_id)
+                cleaned_memory += int(bool(memory_result.get("in_memory")))
+    except Exception:
+        pass
+    result = col.delete_many({"user_id": user_id})
+    journey = create_journey(user_id, "New chat")
+    return {
+        "ok": True,
+        "deleted_count": int(result.deleted_count),
+        "cleaned": {"docs": cleaned_docs, "memory": cleaned_memory},
+        "journey": journey,
+        "journeys": [journey],
+    }
+
+
 def load_journey_messages(user_id: str, journey_id: str) -> list[dict[str, str]]:
     col = journeys_col()
     doc = col.find_one({"user_id": user_id, "journey_id": journey_id})
