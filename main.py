@@ -37,8 +37,11 @@ from docs import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, chunk_text, parse_file
 from embeddings import embed_status
 from files import files_status, get_original_file, store_original_file
 from memory import (
+    compress_history,
+    get_procedural_memory,
     get_user_profile,
     layer_status,
+    list_episodes,
     list_user_facts,
     load_all,
     load_user_profile,
@@ -283,6 +286,10 @@ def memory_detail(journey_id: str = "", user: dict = Depends(current_user)):
         "files": files_status(),
         "profile": get_user_profile(user["user_id"]),
         "profile_text": profile_text,
+        "procedural": get_procedural_memory(user["user_id"]),
+        "episodes": list_episodes(user["user_id"], limit=15),
+        "episodic_notes": loaded.get("episodic_notes", "") if loaded else "",
+        "procedural_notes": loaded.get("procedural_notes", "") if loaded else "",
     }
 
 
@@ -643,6 +650,13 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
     query = latest_user_text(incoming)
     loaded = load_all(user_id, journey_id, incoming, query)
     profile_text, _ = load_user_profile(user_id)
+    
+    # Context compression — summarize old messages if conversation is long
+    compressed_history, compression_report = compress_history(
+        loaded["history"], api_key, GROQ_MODEL, max_messages=8
+    )
+    if compression_report.get("used"):
+        loaded["history"] = compressed_history
 
     def generate():
         try:
@@ -689,6 +703,8 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                 rag_notes=rag_notes,
                 user_role=user_role,
                 user_profile=profile_text,
+                episodic_notes=loaded.get("episodic_notes", ""),
+                procedural_notes=loaded.get("procedural_notes", ""),
             ):
                 if event.get("type") == "agent_route":
                     routed_to = event.get("routed_to") or "assistant"
@@ -842,6 +858,22 @@ def memory_profile_delete(user: dict = Depends(current_user)):
         return {"deleted": True}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ═══════════════════════════════════════════════════════════════
+# EPISODIC & PROCEDURAL MEMORY ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/memory/episodes")
+def memory_episodes(user: dict = Depends(current_user)):
+    """List all conversation episodes for this user."""
+    return {"episodes": list_episodes(user["user_id"], limit=30)}
+
+
+@app.get("/memory/preferences")
+def memory_preferences(user: dict = Depends(current_user)):
+    """Get user procedural preferences."""
+    return {"preferences": get_procedural_memory(user["user_id"]) or {}}
 
 
 # ═══════════════════════════════════════════════════════════════

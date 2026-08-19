@@ -63,6 +63,16 @@ def researcher_generate(state: AgentState, config: RunnableConfig) -> dict[str, 
     if profile:
         system += "\n\nUser profile:\n" + profile
 
+    # Inject episodic memory
+    episodic = (state.get("episodic_notes") or "").strip()
+    if episodic:
+        system += "\n\nPast conversations:\n" + episodic
+
+    # Inject procedural memory
+    procedural = (state.get("procedural_notes") or "").strip()
+    if procedural:
+        system += "\n\nUser preferences:\n" + procedural
+
     # Inject memory
     notes = (state.get("memory_notes") or "").strip()
     if notes:

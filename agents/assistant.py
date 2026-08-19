@@ -65,6 +65,16 @@ def assistant_generate(state: AgentState, config: RunnableConfig) -> dict[str, A
         system += "\n\n=== USER PROFILE (use this to personalize responses) ===\n" + profile
         system += "\nIMPORTANT: If the user shared their name, USE IT in your response."
 
+    # Inject episodic memory
+    episodic = (state.get("episodic_notes") or "").strip()
+    if episodic:
+        system += "\n\n=== PAST CONVERSATIONS (reference when relevant) ===\n" + episodic
+
+    # Inject procedural memory
+    procedural = (state.get("procedural_notes") or "").strip()
+    if procedural:
+        system += "\n\n=== USER PREFERENCES (follow these) ===\n" + procedural
+
     # Inject memory notes
     notes = (state.get("memory_notes") or "").strip()
     if notes:

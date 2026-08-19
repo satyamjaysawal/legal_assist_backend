@@ -14,6 +14,8 @@ class AgentState(TypedDict, total=False):
     memory_notes: str
     rag_notes: str
     user_profile: str
+    episodic_notes: str
+    procedural_notes: str
     active_agent: str
     routed_to: str
     agent_metadata: dict[str, Any]

@@ -10,6 +10,9 @@ LTM_LIMIT = 8
 MONGO_DB = os.getenv("MONGODB_DB", "legal_assist_inhouse")
 LTM_COLLECTION = "long_term_memory"
 PROFILE_COLLECTION = "user_profiles"
+SEMANTIC_COLLECTION = "semantic_memory"
+EPISODIC_COLLECTION = "episodic_memory"
+PROCEDURAL_COLLECTION = "procedural_memory"
 
 _in_memory: dict[str, list[dict[str, str]]] = {}
 _redis = None
@@ -320,6 +323,36 @@ def load_all(
     thread, thread_report = load_thread(user_id, journey_id)
     facts, ltm_report = load_long_term(user_id, query)
     history = merge_history(inmem, stm, thread, incoming)
+
+    # Semantic memory (vector similarity)
+    semantic_facts, semantic_report = load_semantic_facts(user_id, query)
+
+    # Episodic memory (past conversation episodes)
+    recent_eps = load_recent_episodes(user_id, limit=3)
+    relevant_eps = load_relevant_episodes(user_id, query, limit=3)
+    # Deduplicate by journey_id
+    seen_jids = set()
+    episodes = []
+    for ep in recent_eps + relevant_eps:
+        jid = ep.get("journey_id")
+        if jid not in seen_jids:
+            seen_jids.add(jid)
+            episodes.append(ep)
+    episodic_notes = format_episodes(episodes[:5])
+    episodic_report = {
+        "name": "episodic",
+        "label": "Episodic",
+        "store": "MongoDB",
+        "used": bool(episodes),
+        "status": "hit" if episodes else "miss",
+        "when": _now(),
+        "episodes": len(episodes),
+        "detail": f"{len(episodes)} episode(s) recalled",
+    }
+
+    # Procedural memory (user preferences)
+    procedural_notes, proc_report = load_procedural_memory(user_id)
+
     notes = ""
     if facts:
         notes = "\n".join(
@@ -327,11 +360,22 @@ def load_all(
             for item in facts
             if item.get("summary")
         )
+    # Merge semantic facts into notes
+    if semantic_facts:
+        semantic_lines = "\n".join(
+            f"- [{f.get('domain', 'general')}] {f['text']}"
+            for f in semantic_facts
+            if f.get("text")
+        )
+        notes = (notes + "\n" + semantic_lines).strip() if notes else semantic_lines
+
     return {
         "history": history,
         "facts": facts,
         "notes": notes,
-        "layers": [inmem_report, stm_report, thread_report, ltm_report],
+        "episodic_notes": episodic_notes,
+        "procedural_notes": procedural_notes,
+        "layers": [inmem_report, stm_report, thread_report, ltm_report, semantic_report, episodic_report, proc_report],
     }
 
 
@@ -482,7 +526,28 @@ def save_all(
         save_thread(user_id, journey_id, messages, query),
         save_long_term(user_id, journey_id, query, reply, analysis),
     ]
-    # Extract and save personal info from the latest user message
+    # Semantic memory — embed and store the turn
+    try:
+        sem = save_semantic_fact(user_id, query, (analysis or {}).get("domain", "general"), journey_id)
+        if sem:
+            writes.append(sem)
+    except Exception:
+        pass
+    # Episodic memory — save episode
+    try:
+        ep = save_episode(user_id, journey_id, messages, query, reply, analysis)
+        if ep:
+            writes.append(ep)
+    except Exception:
+        pass
+    # Procedural memory — detect preferences
+    try:
+        proc = update_procedural_memory(user_id, messages, query)
+        if proc:
+            writes.append(proc)
+    except Exception:
+        pass
+    # Profile extraction
     try:
         profile_write = extract_and_save_profile(user_id, query)
         if profile_write:
@@ -670,3 +735,476 @@ def update_user_profile(user_id: str, updates: dict[str, Any]) -> dict[str, Any]
         return {"ok": True, "updated": list(updates.keys())}
     except Exception as exc:
         return {"ok": False, "detail": str(exc)}
+
+
+# ═════════════════════════════════════════════════════════════════
+# SEMANTIC MEMORY — vector-based fact retrieval
+# ═════════════════════════════════════════════════════════════════
+
+def _get_semantic_qdrant():
+    """Get Qdrant client and ensure semantic collection exists."""
+    try:
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Distance, VectorParams, PayloadSchemaType
+    except ImportError:
+        return None, "qdrant_client not installed"
+    url = os.getenv("QUDRANT_CLUSTER_ENDPOINT") or os.getenv("QDRANT_URL") or ""
+    api_key = os.getenv("QUDRANT_VECTOR_DB_API_KEY") or os.getenv("QDRANT_API_KEY") or ""
+    if not url or not api_key:
+        return None, "Qdrant not configured"
+    try:
+        client = QdrantClient(url=url, api_key=api_key, timeout=15)
+        if not client.collection_exists(SEMANTIC_COLLECTION):
+            client.create_collection(
+                collection_name=SEMANTIC_COLLECTION,
+                vectors_config=VectorParams(size=int(os.getenv("EMBED_DIM", "768")), distance=Distance.COSINE),
+            )
+            for field in ("user_id", "domain", "journey_id"):
+                try:
+                    client.create_payload_index(
+                        collection_name=SEMANTIC_COLLECTION,
+                        field_name=field,
+                        field_schema=PayloadSchemaType.KEYWORD,
+                    )
+                except Exception:
+                    pass
+        return client, ""
+    except Exception as exc:
+        return None, str(exc)
+
+
+def save_semantic_fact(user_id: str, text: str, domain: str, journey_id: str) -> dict[str, Any] | None:
+    """Embed and store a fact in semantic memory (Qdrant)."""
+    if not user_id or not text or len(text.strip()) < 5:
+        return None
+    try:
+        from embeddings import embed_texts
+        vectors, _ = embed_texts([text], kind="document")
+    except Exception as exc:
+        return {"name": "semantic", "label": "Semantic", "store": "qdrant", "wrote": False, "detail": f"Embed failed: {exc}"}
+    client, err = _get_semantic_qdrant()
+    if client is None:
+        return {"name": "semantic", "label": "Semantic", "store": "qdrant", "wrote": False, "detail": err}
+    try:
+        from qdrant_client.models import PointStruct
+        import uuid as _uuid
+        point = PointStruct(
+            id=str(_uuid.uuid4()),
+            vector=vectors[0],
+            payload={
+                "user_id": user_id,
+                "text": text[:500],
+                "domain": domain or "general",
+                "journey_id": journey_id,
+                "created_at": _now(),
+            },
+        )
+        client.upsert(collection_name=SEMANTIC_COLLECTION, points=[point], wait=True)
+        return {
+            "name": "semantic",
+            "label": "Semantic",
+            "store": "qdrant",
+            "wrote": True,
+            "when": _now(),
+            "detail": f"Saved semantic fact ({domain})",
+        }
+    except Exception as exc:
+        return {"name": "semantic", "label": "Semantic", "store": "qdrant", "wrote": False, "detail": str(exc)}
+
+
+def load_semantic_facts(user_id: str, query: str, limit: int = 5) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Retrieve semantically similar facts from Qdrant."""
+    report = {
+        "name": "semantic",
+        "label": "Semantic",
+        "store": "qdrant",
+        "used": False,
+        "status": "miss",
+        "when": _now(),
+        "hits": 0,
+        "detail": "No semantic facts",
+    }
+    if not user_id or not query or len(query.strip()) < 3:
+        return [], report
+    client, err = _get_semantic_qdrant()
+    if client is None:
+        report["status"] = "error"
+        report["detail"] = err
+        return [], report
+    try:
+        from embeddings import embed_texts
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+        vectors, _ = embed_texts([query], kind="query")
+        qfilter = Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])
+        result = client.query_points(
+            collection_name=SEMANTIC_COLLECTION,
+            query=vectors[0],
+            query_filter=qfilter,
+            limit=limit,
+            with_payload=True,
+        )
+        facts = []
+        for point in result.points:
+            payload = point.payload or {}
+            text = str(payload.get("text") or "").strip()
+            if text:
+                facts.append({
+                    "text": text,
+                    "domain": payload.get("domain", "general"),
+                    "score": round(float(point.score or 0), 4),
+                    "journey_id": payload.get("journey_id", ""),
+                })
+        report["used"] = bool(facts)
+        report["status"] = "hit" if facts else "miss"
+        report["hits"] = len(facts)
+        report["detail"] = f"{len(facts)} semantic fact(s) via vector similarity"
+        return facts, report
+    except Exception as exc:
+        report["status"] = "error"
+        report["detail"] = str(exc)
+        return [], report
+
+
+# ═════════════════════════════════════════════════════════════════
+# EPISODIC MEMORY — conversation episodes with temporal context
+# ═════════════════════════════════════════════════════════════════
+
+def save_episode(
+    user_id: str,
+    journey_id: str,
+    messages: list[dict[str, str]],
+    query: str,
+    reply: str,
+    analysis: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Save a conversation episode to episodic memory."""
+    if not user_id or not query:
+        return None
+    analysis = analysis or {}
+    # Extract simple topics from query words
+    words = [w.lower() for w in re.findall(r"[a-zA-Z]{4,}", query) if w.lower() not in {
+        "what", "when", "where", "which", "about", "would", "could", "should",
+        "please", "help", "want", "need", "know", "like", "this", "that", "have",
+    }]
+    doc = {
+        "user_id": user_id,
+        "journey_id": journey_id,
+        "query": query[:300],
+        "summary": (analysis.get("summary") or query)[:300],
+        "topics": list(dict.fromkeys(words))[:10],
+        "domain": analysis.get("domain", "general"),
+        "intent": analysis.get("intent", "question"),
+        "reply_excerpt": reply[:300],
+        "message_count": len(messages),
+        "created_at": _now(),
+    }
+    client = get_mongo()
+    if client is None:
+        return {"name": "episodic", "label": "Episodic", "store": "mongodb", "wrote": False, "detail": "MongoDB unavailable"}
+    try:
+        client[MONGO_DB][EPISODIC_COLLECTION].insert_one(doc)
+        return {
+            "name": "episodic",
+            "label": "Episodic",
+            "store": "mongodb",
+            "wrote": True,
+            "when": _now(),
+            "detail": f"Saved episode: {query[:50]}",
+        }
+    except Exception as exc:
+        return {"name": "episodic", "label": "Episodic", "store": "mongodb", "wrote": False, "detail": str(exc)}
+
+
+def load_recent_episodes(user_id: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Get most recent episodes for this user."""
+    client = get_mongo()
+    if client is None or not user_id:
+        return []
+    try:
+        docs = list(
+            client[MONGO_DB][EPISODIC_COLLECTION]
+            .find({"user_id": user_id}, {"_id": 0})
+            .sort("created_at", -1)
+            .limit(limit)
+        )
+        return docs
+    except Exception:
+        return []
+
+
+def load_relevant_episodes(user_id: str, query: str, limit: int = 3) -> list[dict[str, Any]]:
+    """Search episodes by keyword scoring against summary and topics."""
+    client = get_mongo()
+    if client is None or not user_id or not query:
+        return []
+    try:
+        docs = list(
+            client[MONGO_DB][EPISODIC_COLLECTION]
+            .find({"user_id": user_id}, {"_id": 0})
+            .sort("created_at", -1)
+            .limit(30)
+        )
+        words = [w.lower() for w in re.findall(r"[a-zA-Z]{3,}", query)]
+        scored = []
+        for doc in docs:
+            blob = " ".join([
+                str(doc.get("summary", "")),
+                str(doc.get("query", "")),
+                " ".join(doc.get("topics", [])),
+                str(doc.get("domain", "")),
+            ]).lower()
+            score = sum(1 for w in words if w in blob)
+            if score > 0:
+                scored.append({**doc, "_score": score})
+        scored.sort(key=lambda x: (x["_score"], x.get("created_at", "")), reverse=True)
+        return scored[:limit]
+    except Exception:
+        return []
+
+
+def format_episodes(episodes: list[dict[str, Any]]) -> str:
+    """Format episodes into text for agent prompts."""
+    if not episodes:
+        return ""
+    parts = []
+    for ep in episodes:
+        when = ep.get("created_at", "")
+        try:
+            dt = datetime.fromisoformat(when)
+            date_str = dt.strftime("%b %d, %Y")
+        except Exception:
+            date_str = when[:10] if when else "recently"
+        domain = ep.get("domain", "general")
+        summary = ep.get("summary") or ep.get("query", "")
+        parts.append(f"- On {date_str} ({domain}): {summary}")
+    return "\n".join(parts)
+
+
+def list_episodes(user_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    """List all episodes for frontend display."""
+    return load_recent_episodes(user_id, limit)
+
+
+# ═════════════════════════════════════════════════════════════════
+# PROCEDURAL MEMORY — user preferences and behavioral patterns
+# ═════════════════════════════════════════════════════════════════
+
+_LANG_PATTERNS = [
+    re.compile(r"\b(hindi|marathi|tamil|telugu|bengali|gujarati|kannada|malayalam|punjabi|urdu)\b", re.IGNORECASE),
+    re.compile(r"[\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0B00-\u0B7F]"),  # Devanagari/Bengali/etc.
+]
+_TONE_PATTERNS = [
+    (re.compile(r"\b(formal|professional|official)\b", re.IGNORECASE), "formal"),
+    (re.compile(r"\b(simple|easy|plain|basic|explain simply)\b", re.IGNORECASE), "simple"),
+    (re.compile(r"\b(detailed|thorough|comprehensive|in.depth)\b", re.IGNORECASE), "detailed"),
+    (re.compile(r"\b(short|brief|concise|quick)\b", re.IGNORECASE), "concise"),
+]
+_FORMAT_PATTERNS = [
+    (re.compile(r"\b(bullet|points|list)\b", re.IGNORECASE), "bullet_points"),
+    (re.compile(r"\b(step.by.step|steps|numbered)\b", re.IGNORECASE), "numbered_steps"),
+    (re.compile(r"\b(table|comparison|compare)\b", re.IGNORECASE), "tables"),
+    (re.compile(r"\b(example|sample|illustrat)\b", re.IGNORECASE), "with_examples"),
+]
+_JURIS_PATTERNS = [
+    re.compile(r"\b(india|indian|bharat)\b", re.IGNORECASE),
+    re.compile(r"\b(usa|united states|american|us law)\b", re.IGNORECASE),
+    re.compile(r"\b(uk|united kingdom|british|english law)\b", re.IGNORECASE),
+]
+
+
+def update_procedural_memory(
+    user_id: str,
+    messages: list[dict[str, str]],
+    query: str,
+) -> dict[str, Any] | None:
+    """Detect and update user preferences from conversation."""
+    if not user_id or not query:
+        return None
+    client = get_mongo()
+    if client is None:
+        return None
+    updates: dict[str, Any] = {}
+
+    # Language detection
+    for pat in _LANG_PATTERNS:
+        if pat.search(query):
+            m = _LANG_PATTERNS[0].search(query)
+            updates["language"] = m.group(1).lower() if m else "regional"
+            break
+
+    # Tone detection
+    for pat, tone in _TONE_PATTERNS:
+        if pat.search(query):
+            updates["tone"] = tone
+            break
+
+    # Format detection
+    for pat, fmt in _FORMAT_PATTERNS:
+        if pat.search(query):
+            updates["format"] = fmt
+            break
+
+    # Jurisdiction detection
+    for pat in _JURIS_PATTERNS:
+        if pat.search(query):
+            m = pat.search(query)
+            updates["jurisdiction"] = m.group(0).capitalize()
+            break
+
+    if not updates:
+        return None
+    try:
+        col = client[MONGO_DB][PROCEDURAL_COLLECTION]
+        existing = col.find_one({"user_id": user_id}, {"_id": 0}) or {}
+        for key, value in updates.items():
+            existing[key] = value
+        existing["user_id"] = user_id
+        existing["updated_at"] = _now()
+        if "created_at" not in existing:
+            existing["created_at"] = _now()
+        # Track interaction count
+        existing["interaction_count"] = existing.get("interaction_count", 0) + 1
+        col.update_one({"user_id": user_id}, {"$set": existing}, upsert=True)
+        return {
+            "name": "procedural",
+            "label": "Procedural",
+            "store": "mongodb",
+            "wrote": True,
+            "when": _now(),
+            "detail": f"Updated preferences: {list(updates.keys())}",
+        }
+    except Exception as exc:
+        return {"name": "procedural", "label": "Procedural", "store": "mongodb", "wrote": False, "detail": str(exc)}
+
+
+def load_procedural_memory(user_id: str) -> tuple[str, dict[str, Any]]:
+    """Load user preferences and return (formatted_text, report)."""
+    report = {
+        "name": "procedural",
+        "label": "Procedural",
+        "store": "mongodb",
+        "used": False,
+        "status": "miss",
+        "when": _now(),
+        "detail": "No preferences stored",
+    }
+    if not user_id:
+        return "", report
+    client = get_mongo()
+    if client is None:
+        return "", report
+    try:
+        col = client[MONGO_DB][PROCEDURAL_COLLECTION]
+        doc = col.find_one({"user_id": user_id}, {"_id": 0})
+        if not doc:
+            return "", report
+        parts = []
+        if doc.get("language"):
+            parts.append(f"Preferred language: {doc['language']}")
+        if doc.get("tone"):
+            parts.append(f"Preferred tone: {doc['tone']}")
+        if doc.get("format"):
+            parts.append(f"Preferred format: {doc['format']}")
+        if doc.get("jurisdiction"):
+            parts.append(f"Default jurisdiction: {doc['jurisdiction']}")
+        if doc.get("interaction_count"):
+            parts.append(f"Total interactions: {doc['interaction_count']}")
+        text = "\n".join(parts) if parts else ""
+        report["used"] = bool(text)
+        report["status"] = "hit" if text else "miss"
+        report["detail"] = f"Preferences: {', '.join(k for k in ['language','tone','format','jurisdiction'] if doc.get(k))}" if text else "No preferences"
+        return text, report
+    except Exception:
+        return "", report
+
+
+def get_procedural_memory(user_id: str) -> dict[str, Any] | None:
+    """Get raw procedural memory document."""
+    if not user_id:
+        return None
+    client = get_mongo()
+    if client is None:
+        return None
+    try:
+        return client[MONGO_DB][PROCEDURAL_COLLECTION].find_one(
+            {"user_id": user_id}, {"_id": 0}
+        )
+    except Exception:
+        return None
+
+
+# ═════════════════════════════════════════════════════════════════
+# CONTEXT COMPRESSION — summarize long conversations (Claude-style)
+# ═════════════════════════════════════════════════════════════════
+
+def compress_history(
+    messages: list[dict[str, str]],
+    api_key: str,
+    model: str,
+    max_messages: int = 8,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Compress old messages into a summary if conversation is too long.
+
+    Returns (compressed_messages, report).
+    Like Claude's approach: keeps recent messages, summarizes older ones.
+    """
+    report = {
+        "name": "compression",
+        "label": "Context compression",
+        "used": False,
+        "status": "skip",
+        "when": _now(),
+        "original_count": len(messages),
+        "compressed_count": 0,
+        "detail": "No compression needed",
+    }
+    if len(messages) <= max_messages:
+        return messages, report
+    old = messages[:-max_messages]
+    recent = messages[-max_messages:]
+    # Build a conversation text from old messages
+    old_text = "\n".join(
+        f"{m.get('role', 'user')}: {(m.get('content') or '')[:200]}"
+        for m in old
+        if (m.get("content") or "").strip()
+    )
+    if not old_text.strip():
+        return messages, report
+    # Use Groq to summarize
+    try:
+        from langchain_groq import ChatGroq
+        from langchain_core.messages import SystemMessage, HumanMessage
+        llm = ChatGroq(
+            api_key=api_key, model=model,
+            temperature=0.1, max_tokens=300, streaming=False,
+        )
+        result = llm.invoke([
+            SystemMessage(content=(
+                "Summarize the following conversation into 2-3 concise sentences. "
+                "Focus on: what the user asked about, key topics discussed, and any "
+                "important facts or decisions. Do NOT include greetings or filler."
+            )),
+            HumanMessage(content=old_text[:3000]),
+        ])
+        summary = str(result.content or "").strip()
+        if not summary:
+            return messages, report
+        compressed = [
+            {"role": "user", "content": f"[Earlier conversation summary: {summary}]"},
+            {"role": "assistant", "content": "I remember our earlier discussion. Let me continue helping you."},
+            *recent,
+        ]
+        report.update(
+            used=True,
+            status="done",
+            original_count=len(messages),
+            compressed_count=len(old),
+            summary=summary[:200],
+            detail=f"Compressed {len(old)} old messages into summary, kept {len(recent)} recent",
+        )
+        return compressed, report
+    except Exception as exc:
+        # Fallback: just return recent messages without summary
+        report["status"] = "error"
+        report["detail"] = f"Compression failed: {exc}, returning last {max_messages} messages"
+        return recent, report

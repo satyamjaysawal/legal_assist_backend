@@ -73,6 +73,8 @@ def stream_multi_graph(
     rag_notes: str = "",
     user_role: str = "user",
     user_profile: str = "",
+    episodic_notes: str = "",
+    procedural_notes: str = "",
 ) -> Iterator[dict[str, Any]]:
     """Stream events from the multi-agent graph.
 
@@ -102,6 +104,8 @@ def stream_multi_graph(
                 "memory_notes": memory_notes,
                 "rag_notes": rag_notes,
                 "user_profile": user_profile,
+                "episodic_notes": episodic_notes,
+                "procedural_notes": procedural_notes,
                 "active_agent": "",
                 "routed_to": "",
                 "agent_metadata": {},

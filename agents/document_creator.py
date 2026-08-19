@@ -71,6 +71,16 @@ def document_creator_generate(state: AgentState, config: RunnableConfig) -> dict
     if profile:
         system += "\n\nUser profile (fill in placeholders):\n" + profile
 
+    # Inject episodic memory
+    episodic = (state.get("episodic_notes") or "").strip()
+    if episodic:
+        system += "\n\nPast conversations:\n" + episodic
+
+    # Inject procedural memory
+    procedural = (state.get("procedural_notes") or "").strip()
+    if procedural:
+        system += "\n\nUser preferences:\n" + procedural
+
     notes = (state.get("memory_notes") or "").strip()
     if notes:
         system += "\n\nUser context:\n" + notes

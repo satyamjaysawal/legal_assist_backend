@@ -107,6 +107,16 @@ def lawyer_finder_generate(state: AgentState, config: RunnableConfig) -> dict[st
     if profile:
         system += "\n\nUser profile:\n" + profile
 
+    # Inject episodic memory
+    episodic = (state.get("episodic_notes") or "").strip()
+    if episodic:
+        system += "\n\nPast conversations:\n" + episodic
+
+    # Inject procedural memory
+    procedural = (state.get("procedural_notes") or "").strip()
+    if procedural:
+        system += "\n\nUser preferences:\n" + procedural
+
     if analysis:
         system += (
             f"\n\nUser's legal need:\n"

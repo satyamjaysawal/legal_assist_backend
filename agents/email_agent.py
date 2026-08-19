@@ -80,6 +80,16 @@ def email_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     if profile:
         system += "\n\nUser profile (use for signature/sender):\n" + profile
 
+    # Inject episodic memory
+    episodic = (state.get("episodic_notes") or "").strip()
+    if episodic:
+        system += "\n\nPast conversations:\n" + episodic
+
+    # Inject procedural memory
+    procedural = (state.get("procedural_notes") or "").strip()
+    if procedural:
+        system += "\n\nUser preferences (tone/format):\n" + procedural
+
     notes = (state.get("memory_notes") or "").strip()
     if notes:
         system += "\n\nUser context:\n" + notes
