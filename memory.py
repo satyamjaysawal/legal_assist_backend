@@ -4,6 +4,10 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+import logging
+
+logger = logging.getLogger("legal_assist.memory")
+
 STM_TTL_SECONDS = int(os.getenv("REDIS_TTL_SECONDS", "21600"))
 STM_WINDOW = 20
 LTM_LIMIT = 8
@@ -531,29 +535,29 @@ def save_all(
         sem = save_semantic_fact(user_id, query, (analysis or {}).get("domain", "general"), journey_id)
         if sem:
             writes.append(sem)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Semantic memory save failed: %s", exc)
     # Episodic memory — save episode
     try:
         ep = save_episode(user_id, journey_id, messages, query, reply, analysis)
         if ep:
             writes.append(ep)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Episodic memory save failed: %s", exc)
     # Procedural memory — detect preferences
     try:
         proc = update_procedural_memory(user_id, messages, query)
         if proc:
             writes.append(proc)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Procedural memory save failed: %s", exc)
     # Profile extraction
     try:
         profile_write = extract_and_save_profile(user_id, query)
         if profile_write:
             writes.append(profile_write)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Profile extraction failed: %s", exc)
     return writes
 
 

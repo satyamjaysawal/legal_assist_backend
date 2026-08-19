@@ -6,10 +6,14 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+import logging
+
 from memory import get_redis
 
+logger = logging.getLogger("legal_assist.cache")
+
 PROMPT_CACHE_TTL = int(os.getenv("PROMPT_CACHE_TTL", "21600"))
-SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.90"))
+SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.65"))
 SEMANTIC_INDEX_KEY = "legal_assist:scache:index"
 SEMANTIC_MAX_ENTRIES = int(os.getenv("SEMANTIC_MAX_ENTRIES", "300"))
 _local: dict[str, dict[str, Any]] = {}
@@ -65,6 +69,7 @@ def get_prompt_cache(query: str, model: str, extra: str = "") -> tuple[dict[str,
             store="in_memory",
             detail="Hit in-memory prompt cache",
         )
+        logger.info("Exact cache HIT (in_memory) for %s", cache_id)
         return local, report
     client = get_redis()
     if client is None:
@@ -82,6 +87,7 @@ def get_prompt_cache(query: str, model: str, extra: str = "") -> tuple[dict[str,
             store="redis",
             detail="Hit Redis prompt cache",
         )
+        logger.info("Exact cache HIT (redis) for %s", cache_id)
         return payload, report
     except Exception as exc:
         report["status"] = "error"
@@ -251,6 +257,7 @@ def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, A
     }
     _sem_local[entry_id] = entry
     report.update(wrote=True, store="in_memory", detail="Stored query embedding in local semantic index")
+    logger.info("Semantic cache STORE %s (local index size %d)", entry_id, len(_sem_local))
     client = get_redis()
     if client is None:
         return report

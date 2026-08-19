@@ -3,8 +3,15 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import hashlib
+import logging
+import math
+import re
+
 from dotenv import load_dotenv
 from groq import Groq
+
+logger = logging.getLogger("legal_assist.embeddings")
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 load_dotenv(Path(__file__).resolve().parent.parent / "legal_assist" / ".env")
@@ -65,6 +72,37 @@ def _fastembed_embed(texts: list[str]) -> list[list[float]]:
     return [vec.tolist() for vec in _fastembed.embed(texts)]
 
 
+def _hash_embed(texts: list[str]) -> list[list[float]]:
+    """Deterministic bag-of-words feature-hashing embeddings.
+
+    Zero-dependency fallback for serverless environments where Groq
+    embeddings are unavailable and FastEmbed cannot write model files
+    to disk.  Cosine similarity over these vectors approximates token
+    overlap — good enough for semantic cache / semantic memory.
+    """
+    vectors: list[list[float]] = []
+    for text in texts:
+        vec = [0.0] * EMBED_DIM
+        raw = re.findall(r"[a-z0-9]+", (text or "").lower())
+        # light suffix-stripping so "filing"/"filed"/"files" ≈ "file"
+        tokens = [
+            t[:-3] if len(t) > 5 and t.endswith("ing") else
+            t[:-2] if len(t) > 4 and t.endswith("ed") else
+            t[:-2] if len(t) > 3 and t.endswith("ly") else
+            t[:-1] if len(t) > 3 and t.endswith("s") else t
+            for t in raw
+        ]
+        grams = tokens + [f"{a}_{b}" for a, b in zip(tokens, tokens[1:])]
+        for gram in grams:
+            digest = hashlib.md5(gram.encode("utf-8")).digest()
+            idx = int.from_bytes(digest[:4], "little") % EMBED_DIM
+            sign = 1.0 if digest[4] % 2 == 0 else -1.0
+            vec[idx] += sign
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        vectors.append([v / norm for v in vec])
+    return vectors
+
+
 def embed_texts(texts: list[str], kind: str = "document") -> tuple[list[list[float]], dict[str, Any]]:
     global _provider, _last_error
     prepared = [_prefixed(text, kind) for text in texts if (text or "").strip()]
@@ -94,6 +132,7 @@ def embed_texts(texts: list[str], kind: str = "document") -> tuple[list[list[flo
             return vectors, report
         except Exception as exc:
             _last_error = str(exc)
+            logger.warning("Groq embeddings unavailable (%s); trying FastEmbed", exc)
             report["detail"] = f"Groq embeddings unavailable ({exc}). Falling back to FastEmbed."
     try:
         vectors = _fastembed_embed(prepared)
@@ -107,5 +146,13 @@ def embed_texts(texts: list[str], kind: str = "document") -> tuple[list[list[flo
         return vectors, report
     except Exception as exc:
         _last_error = str(exc)
-        report.update(status="error", detail=str(exc), provider="none")
-        raise RuntimeError(f"Could not embed text: {exc}") from exc
+        logger.warning("FastEmbed unavailable (%s); using deterministic hash embeddings", exc)
+    vectors = _hash_embed(prepared)
+    _provider = "hash"
+    report.update(
+        provider="hash",
+        model="hash-bow-768",
+        status="hit",
+        detail=f"Hash fallback embeddings (serverless-safe) · {len(vectors)} vector(s)",
+    )
+    return vectors, report

@@ -2,10 +2,16 @@ import json
 import re
 from typing import Any, Iterator, Optional, TypedDict
 
+import logging
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
 from langgraph.graph import END, START, StateGraph
+
+from agents.base import invoke_text
+
+logger = logging.getLogger("legal_assist.graph")
 
 ANALYZER_PROMPT = """You are a legal query analyser for a legal AI assistant.
 Read the latest user message (and short chat context) and return ONLY valid JSON:
@@ -242,32 +248,38 @@ def stream_graph(
 
 def suggest_title(query: str, reply: str, api_key: str, model: str) -> str:
     llm = get_llm(api_key, model, temperature=0.2)
-    result = llm.invoke(
+    config = {"configurable": {"api_key": api_key, "model": model}}
+    text = invoke_text(
+        llm,
         [
             SystemMessage(
                 content="Create a 3 to 6 word chat title for a legal conversation. "
                 "No quotes, no period, no markdown."
             ),
             HumanMessage(content=f"User: {query[:300]}\nAssistant: {reply[:400]}"),
-        ]
+        ],
+        config,
     )
-    title = re.sub(r'["“”]', "", str(result.content or "")).strip()
+    title = re.sub(r'["“”]', "", text).strip()
     title = re.sub(r"\s+", " ", title).rstrip(".")
+    logger.info("Suggested title: %s", title[:80])
     return title[:80] or (query[:48] or "New chat")
 
 
 def suggest_followups(query: str, reply: str, api_key: str, model: str) -> list[str]:
     llm = get_llm(api_key, model, temperature=0.4)
-    result = llm.invoke(
+    config = {"configurable": {"api_key": api_key, "model": model}}
+    text = invoke_text(
+        llm,
         [
             SystemMessage(
                 content="Suggest 3 short follow-up questions the user might ask next. "
                 "Return ONLY a JSON array of 3 strings. No markdown."
             ),
             HumanMessage(content=f"User: {query[:400]}\nAssistant: {reply[:700]}"),
-        ]
+        ],
+        config,
     )
-    text = str(result.content or "").strip()
     match = re.search(r"\[.*\]", text, re.DOTALL)
     raw = match.group(0) if match else text
     try:
@@ -275,4 +287,5 @@ def suggest_followups(query: str, reply: str, api_key: str, model: str) -> list[
     except json.JSONDecodeError:
         items = [line.strip("-• ").strip() for line in text.splitlines() if line.strip()]
     cleaned = [str(item).strip() for item in items if str(item).strip()]
+    logger.info("Suggested %d follow-up question(s)", len(cleaned[:3]))
     return cleaned[:3]

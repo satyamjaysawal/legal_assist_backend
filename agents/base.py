@@ -3,8 +3,12 @@
 import time
 from typing import Any, Callable, Optional, TypedDict
 
+import logging
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
+
+logger = logging.getLogger("legal_assist.agents")
 
 
 # ── Shared agent state ──────────────────────────────────────────
@@ -128,8 +132,10 @@ def invoke_text(llm, messages, config: Optional[dict] = None, retries: int = 3) 
             if text:
                 return text
             last_error = RuntimeError("LLM returned empty content")
+            logger.warning("LLM attempt %d (%s) returned empty content", attempt + 1, getattr(current, "model_name", "?"))
         except Exception as exc:  # noqa: BLE001 — retry on any provider error
             last_error = exc
+            logger.warning("LLM attempt %d (%s) failed: %s", attempt + 1, getattr(current, "model_name", "?"), exc)
             if _is_provider_rate_limit(exc) and config:
                 cfg = config.get("configurable", {}) or {}
                 api_key = cfg.get("api_key", "")
@@ -138,9 +144,11 @@ def invoke_text(llm, messages, config: Optional[dict] = None, retries: int = 3) 
                     if fallback != current_model:
                         temp = float(getattr(current, "temperature", 0.4) or 0.4)
                         current = get_llm(api_key, fallback, temperature=temp)
+                        logger.info("Rate-limited — switching to fallback model %s", fallback)
                         break
         if attempt < retries:
             time.sleep(1.0 * (attempt + 1))
+    logger.error("All %d LLM attempts failed: %s", retries + 1, last_error)
     raise last_error or RuntimeError("LLM returned empty content")
 
 

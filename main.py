@@ -3,6 +3,8 @@ import os
 import uuid
 from pathlib import Path
 
+import logging
+
 from dotenv import load_dotenv
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket
@@ -65,6 +67,12 @@ load_dotenv(ROOT.parent / "legal_assist" / ".env")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("legal_assist.api")
 
 app = FastAPI(title="Legal AI Assistant")
 
@@ -671,6 +679,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
     
             # ── Greeting fast-path ──
             if _is_simple_greeting(query):
+                logger.info("v2 chat | user=%s journey=%s | greeting fast-path", user_id, journey_id)
                 reply = _GREETING_REPLY
                 analysis = {
                     "intent": "other", "domain": "general", "complexity": "simple",
@@ -696,6 +705,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                 return
     
             yield sse({"type": "thinking", "text": "Multi-agent pipeline starting…"})
+            logger.info("v2 chat | user=%s journey=%s query=%r", user_id, journey_id, query[:120])
             yield step("memory", "done", f"{len(loaded['layers'])} memory layer(s) · {len(loaded['facts'])} fact(s) loaded")
             yield sse({
                 "type": "memory",
@@ -710,6 +720,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
             yield sse({"type": "thinking", "text": "Checking exact-match cache…"})
             cached, exact_report = get_prompt_cache(query, GROQ_MODEL)
             yield sse({"type": "cache", "report": exact_report})
+            logger.info("Exact cache %s | %s", exact_report.get("status"), exact_report.get("detail"))
             yield step(
                 "cache_exact",
                 "hit" if cached else "miss",
@@ -723,6 +734,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     sem_report.get("status") or "miss",
                     sem_report.get("detail") or "Semantic cache lookup",
                 )
+                logger.info("Semantic cache %s | %s", sem_report.get("status"), sem_report.get("detail"))
                 if sem_cached and sem_cached.get("reply"):
                     cached = sem_cached
 
@@ -759,6 +771,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
             yield sse({"type": "thinking", "text": "Searching uploaded documents (RAG)…"})
             hits, rag_report = search_docs(user_id, query, journey_id)
             rag_notes = format_hits(hits)
+            logger.info("RAG %s | %d hit(s)", rag_report.get("status"), len(hits))
             yield step(
                 "rag",
                 "hit" if hits else "miss",
@@ -790,6 +803,10 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     routed_to = event.get("routed_to") or "assistant"
                     analysis = event.get("analysis")
                     a = analysis or {}
+                    logger.info(
+                        "Orchestrator routed to %s | intent=%s domain=%s complexity=%s",
+                        routed_to, a.get("intent"), a.get("domain"), a.get("complexity"),
+                    )
                     yield step(
                         "orchestrator",
                         "done",
@@ -821,6 +838,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                 # "done" and unknown events are handled after the loop
     
             reply = "".join(reply_parts).strip()
+            logger.info("Specialist %s finished | reply=%d chars", routed_to, len(reply))
             if reply:
                 # Title + followups
                 title = query[:60]
@@ -829,6 +847,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     title = suggest_title(query, reply, api_key, GROQ_MODEL)
                     yield step("title", "done", f"“{title}”")
                 except Exception:
+                    logger.warning("Title generation failed — using query excerpt")
                     yield step("title", "skip", "Using query excerpt as title")
                 followups: list[str] = []
                 yield step("followups", "running", "LLM generating follow-up questions…")
@@ -836,6 +855,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     followups = suggest_followups(query, reply, api_key, GROQ_MODEL)
                     yield step("followups", "done", f"{len(followups)} question(s) generated from query + reply")
                 except Exception:
+                    logger.warning("Follow-up generation failed")
                     yield step("followups", "skip", "Could not generate follow-ups")
 
                 # ── Store exact + semantic cache entries ──
@@ -881,6 +901,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     yield sse({"type": "followups", "questions": followups})
                 yield sse({"type": "done", "model": GROQ_MODEL, "agent": routed_to})
         except Exception as exc:
+            logger.exception("Multi-agent pipeline error")
             yield sse({"type": "error", "detail": f"Multi-agent error: {exc}"})
 
     return StreamingResponse(
