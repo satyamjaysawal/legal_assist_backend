@@ -5,7 +5,21 @@
       "src": "main.py",
       "use": "@vercel/python",
       "config": {
-        "includeFiles": ["graph.py", "memory.py", "auth.py", "journeys.py", "cache.py", "embeddings.py", "docs.py", "vectordb.py", "files.py"]
+        "includeFiles": [
+          "graph.py",
+          "memory.py",
+          "auth.py",
+          "journeys.py",
+          "cache.py",
+          "embeddings.py",
+          "docs.py",
+          "vectordb.py",
+          "files.py",
+          "multi_graph.py",
+          "agents/**/*.py",
+          "connectors/**/*.py",
+          "websocket/**/*.py"
+        ]
       }
     }
   ],
