@@ -82,13 +82,16 @@ _STOPWORDS = {
 }
 
 # Canonical synonym groups — maps surface forms to one token so that
-# paraphrases ("explain"/"tell", "steps"/"process", "how"/"what") overlap.
+# paraphrases ("explain"/"tell", "steps"/"process") overlap.
+# NOTE: interrogatives (how/what/who) are deliberately NOT grouped —
+# they appear in nearly every question and cause cross-topic false hits.
 _SYNONYMS: dict[str, str] = {}
 for _canon, _members in {
     "describe": ["explain", "tell", "describe", "show", "list", "detail"],
     "process": ["steps", "step", "process", "procedure", "way", "ways", "method"],
-    "how": ["how", "what", "which", "why", "when", "where", "who"],
-    "file": ["file", "filing", "submit", "apply", "application", "lodge"],
+    "file": ["file", "fil", "submit", "submitt", "apply", "application", "lodge"],
+    "walk": ["walk", "guide", "through"],
+    "know": ["know", "learn", "understand"],
 }.items():
     for _m in _members:
         _SYNONYMS[_m] = _canon
@@ -112,16 +115,17 @@ def _tokenize(text: str) -> list[str]:
     return tokens
 
 
-def _hash_embed(texts: list[str]) -> list[list[float]]:
+def _hash_embed(texts: list[str]) -> tuple[list[list[float]], list[float]]:
     """Deterministic bag-of-words feature-hashing embeddings.
 
     Zero-dependency fallback for serverless environments where Groq
     embeddings are unavailable and FastEmbed cannot write model files
-    to disk.  Cosine similarity over these vectors approximates token
-    overlap — good enough for semantic cache / semantic memory.
-    Unigrams carry double weight so short paraphrases still score well.
+    to disk.  Returns L2-normalized vectors plus raw norms so callers
+    can compute containment-style similarity for uneven text lengths.
+    Unigrams carry triple weight so short paraphrases still score well.
     """
     vectors: list[list[float]] = []
+    norms: list[float] = []
     for text in texts:
         vec = [0.0] * EMBED_DIM
         tokens = _tokenize(text)
@@ -133,12 +137,13 @@ def _hash_embed(texts: list[str]) -> list[list[float]]:
             vec[idx] += sign * weight
 
         for token in tokens:
-            bump(token, 2.0)
+            bump(token, 3.0)
         for a, b in zip(tokens, tokens[1:]):
             bump(f"{a}_{b}", 1.0)
-        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-        vectors.append([v / norm for v in vec])
-    return vectors
+        norm = math.sqrt(sum(v * v for v in vec))
+        norms.append(norm)
+        vectors.append([v / norm for v in vec] if norm else vec)
+    return vectors, norms
 
 
 def embed_texts(texts: list[str], kind: str = "document") -> tuple[list[list[float]], dict[str, Any]]:
@@ -166,6 +171,7 @@ def embed_texts(texts: list[str], kind: str = "document") -> tuple[list[list[flo
                 provider="groq",
                 status="hit",
                 detail=f"Groq {GROQ_EMBED_MODEL} · {len(vectors)} vector(s)",
+                norms=[math.sqrt(sum(x * x for x in v)) for v in vectors],
             )
             return vectors, report
         except Exception as exc:
@@ -180,6 +186,7 @@ def embed_texts(texts: list[str], kind: str = "document") -> tuple[list[list[flo
             model=FASTEMBED_MODEL,
             status="hit",
             detail=f"FastEmbed {FASTEMBED_MODEL} · {len(vectors)} vector(s)",
+            norms=[math.sqrt(sum(x * x for x in v)) for v in vectors],
         )
         return vectors, report
     except Exception as exc:
@@ -190,12 +197,13 @@ def embed_texts(texts: list[str], kind: str = "document") -> tuple[list[list[flo
     # tokens to every hash vector, inflating similarity for short texts and
     # causing semantic-cache false positives.
     raw_texts = [text for text in texts if (text or "").strip()]
-    vectors = _hash_embed(raw_texts)
+    vectors, norms = _hash_embed(raw_texts)
     _provider = "hash"
     report.update(
         provider="hash",
         model="hash-bow-768",
         status="hit",
         detail=f"Hash fallback embeddings (serverless-safe) · {len(vectors)} vector(s)",
+        norms=norms,
     )
     return vectors, report

@@ -161,7 +161,12 @@ def _load_sem_index() -> dict[str, dict[str, Any]]:
 
 
 def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    """Find a cached answer whose query embedding is close to this query."""
+    """Find a cached answer whose query embedding covers this query.
+
+    Uses containment scoring — how much of THIS query's content is
+    covered by the cached entry — so a short paraphrase of a longer
+    cached query still hits, while unrelated topics stay near zero.
+    """
     report: dict[str, Any] = {
         "name": "semantic_cache",
         "label": "Semantic cache",
@@ -180,15 +185,24 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
 
         vectors, _emb = embed_texts([query], kind="query")
         qvec = vectors[0]
+        q_norm = (_emb.get("norms") or [1.0])[0]
     except Exception as exc:
         report.update(status="skip", detail=f"Embeddings unavailable — semantic cache skipped ({exc})")
+        return None, report
+    if not q_norm:
+        report["detail"] = "Query has no comparable content tokens — semantic cache skipped"
         return None, report
 
     best_id, best_score, best_entry = "", 0.0, None
     for entry_id, entry in index.items():
         if entry.get("model") != model:
             continue
-        score = _cosine(qvec, entry.get("vector") or [])
+        dvec = entry.get("vector") or []
+        if not dvec:
+            continue
+        # containment = cosine * (||cached|| / ||query||) on L2-normalized vectors
+        d_norm = entry.get("norm") or 1.0
+        score = min(1.0, _cosine(qvec, dvec) * d_norm / q_norm)
         if score > best_score:
             best_id, best_score, best_entry = entry_id, score, entry
 
@@ -224,7 +238,7 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
         status="hit",
         store="redis+memory",
         entry_id=best_id,
-        detail=f"{best_score:.0%} similar to cached query “{(best_entry.get('query') or '')[:60]}”",
+        detail=f"{best_score:.0%} match with cached query “{(best_entry.get('query') or '')[:60]}”",
     )
     return payload, report
 
@@ -243,8 +257,12 @@ def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, A
 
         vectors, _emb = embed_texts([query], kind="query")
         qvec = vectors[0]
+        q_norm = (_emb.get("norms") or [1.0])[0]
     except Exception as exc:
         report["detail"] = f"Embeddings unavailable — semantic store skipped ({exc})"
+        return report
+    if not q_norm:
+        report["detail"] = "Query has no comparable content tokens — semantic store skipped"
         return report
 
     entry_id = prompt_cache_id(query, model, extra) + "s"
@@ -253,6 +271,7 @@ def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, A
         "query": query,
         "model": model,
         "vector": qvec,
+        "norm": q_norm,
         "cached_at": _now(),
     }
     _sem_local[entry_id] = entry
