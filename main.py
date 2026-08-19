@@ -113,6 +113,34 @@ def require_key() -> str:
     return GROQ_API_KEY
 
 
+# ── Greeting fast-path ─────────────────────────────────────────
+import re as _re
+
+_GREETING_PATTERNS = _re.compile(
+    r"^(hi+|hello|hey|heyy+|howdy|sup|yo+|namaste|good\s*(morning|afternoon|evening)|"
+    r"hola|what'?s?\s*up|w+sup)[\s!?.]*$",
+    _re.IGNORECASE,
+)
+
+_GREETING_REPLY = (
+    "Hello! I'm your Legal AI Assistant. I can help you with:\n\n"
+    "- **General legal questions** — explain concepts, rights, and procedures\n"
+    "- **Document drafting** — notices, agreements, letters, petitions\n"
+    "- **Legal research** — case law, statutes, comparisons\n"
+    "- **Email composition** — professional legal emails\n"
+    "- **Finding a lawyer** — connect with specialists\n\n"
+    "Just ask me anything, and I'll route you to the right specialist agent!"
+)
+
+
+def _is_simple_greeting(text: str) -> bool:
+    """Return True if the text is just a greeting with no substantive query."""
+    cleaned = text.strip()
+    if len(cleaned) > 40:
+        return False
+    return bool(_GREETING_PATTERNS.match(cleaned))
+
+
 def cleaned_messages(req: ChatRequest) -> list[dict[str, str]]:
     messages = [
         {"role": item.role, "content": item.content.strip()}
@@ -606,7 +634,30 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
 
     def generate():
         try:
-            yield sse({"type": "thinking", "text": "Multi-agent pipeline starting…"})
+            # ── Greeting fast-path ──
+            if _is_simple_greeting(query):
+                reply = _GREETING_REPLY
+                analysis = {
+                    "intent": "other", "domain": "general", "complexity": "simple",
+                    "jurisdiction": "unspecified", "on_topic": True,
+                    "summary": "Greeting", "refined_query": query, "route_to": "assistant",
+                }
+                yield sse({"type": "agent_route", "routed_to": "assistant", "analysis": analysis, "metadata": {}})
+                yield sse({"type": "analysis", "analysis": analysis, "model": GROQ_MODEL})
+                yield sse({"type": "token", "content": reply})
+                stored = loaded["history"] + [{"role": "assistant", "content": reply}]
+                writes = save_all(journey_id, user_id, stored, "Greeting", reply, analysis)
+                yield sse({"type": "memory_write", "writes": writes, "journey_id": journey_id, "title": "Greeting"})
+                followups = [
+                    "Can you help me draft a lease agreement?",
+                    "What are the steps to file a small claims case?",
+                    "What should I know about my tenant rights?",
+                ]
+                yield sse({"type": "followups", "questions": followups})
+                yield sse({"type": "done", "model": GROQ_MODEL, "agent": "assistant"})
+                return
+    
+            yield sse({"type": "thinking", "text": "Multi-agent pipeline starting\u2026"})
 
             # RAG search
             hits, rag_report = search_docs(user_id, query, journey_id)
@@ -688,6 +739,21 @@ def chat_guest(req: ChatRequest, user: dict | None = Depends(optional_user)):
     if len(incoming) > 6:  # 3 user + 3 assistant = 6
         raise HTTPException(status_code=403, detail="Guest mode is limited to 3 messages. Please sign up for full access.")
     query = latest_user_text(incoming)
+
+    # ── Greeting fast-path ──
+    if _is_simple_greeting(query):
+        return {
+            "reply": _GREETING_REPLY,
+            "model": GROQ_MODEL,
+            "routed_to": "assistant",
+            "analysis": {
+                "intent": "other", "domain": "general", "complexity": "simple",
+                "jurisdiction": "unspecified", "on_topic": True,
+                "summary": "Greeting", "refined_query": query, "route_to": "assistant",
+            },
+            "guest_mode": True,
+            "limit": "3 messages — sign up for unlimited access",
+        }
 
     try:
         result_data = {}
