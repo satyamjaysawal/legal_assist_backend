@@ -523,7 +523,11 @@ def save_all(
     query: str,
     reply: str,
     analysis: dict[str, Any] | None,
+    user_text: str = "",
 ):
+    # `query` may be a generated chat title (used for episode/thread labels);
+    # profile facts must be mined from the user's actual message instead.
+    raw_user_text = user_text or query
     writes = [
         save_in_memory(user_id, journey_id, messages),
         save_short_term(user_id, journey_id, messages),
@@ -553,7 +557,7 @@ def save_all(
         logger.warning("Procedural memory save failed: %s", exc)
     # Profile extraction
     try:
-        profile_write = extract_and_save_profile(user_id, query)
+        profile_write = extract_and_save_profile(user_id, raw_user_text)
         if profile_write:
             writes.append(profile_write)
     except Exception as exc:

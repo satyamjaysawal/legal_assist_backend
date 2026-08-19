@@ -582,7 +582,7 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
                 )
                 yield sse({"type": "cache_write", "report": cache_write})
                 stored = loaded["history"] + [{"role": "assistant", "content": reply}]
-                writes = save_all(journey_id, user_id, stored, title or query, reply, analysis)
+                writes = save_all(journey_id, user_id, stored, title or query, reply, analysis, user_text=query)
                 yield sse(
                     {
                         "type": "memory_write",
@@ -762,7 +762,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                 yield step(routed, "done", "Reply served from cache — no LLM call")
                 yield sse({"type": "token", "content": cached["reply"]})
                 stored = loaded["history"] + [{"role": "assistant", "content": cached["reply"]}]
-                writes = save_all(journey_id, user_id, stored, cached.get("title") or query, cached["reply"], analysis)
+                writes = save_all(journey_id, user_id, stored, cached.get("title") or query, cached["reply"], analysis, user_text=query)
                 yield step("memory_write", "done", f"{sum(1 for w in writes if w.get('wrote'))} memory store(s) updated")
                 yield sse({"type": "memory_write", "writes": writes, "journey_id": journey_id, "title": cached.get("title") or ""})
                 if cached.get("followups"):
@@ -904,7 +904,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                 })
     
                 stored = loaded["history"] + [{"role": "assistant", "content": reply}]
-                writes = save_all(journey_id, user_id, stored, title or query, reply, analysis)
+                writes = save_all(journey_id, user_id, stored, title or query, reply, analysis, user_text=query)
                 yield step(
                     "memory_write",
                     "done",
