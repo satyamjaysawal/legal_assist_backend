@@ -5,12 +5,16 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from auth import current_user, login_user, make_token, register_user, update_user
+from auth import (
+    ALL_ROLES, ROLE_GUEST, ROLE_USER, ROLE_LAWYER, ROLE_ADMIN,
+    current_user, login_user, make_token, register_user, update_user,
+    optional_user, require_role,
+)
 from graph import (
     DEFAULT_ANALYSIS,
     build_graph,
@@ -18,6 +22,14 @@ from graph import (
     stream_graph,
     suggest_followups,
     suggest_title,
+)
+from multi_graph import build_multi_graph, stream_multi_graph
+from agents.base import list_agents as list_registered_agents
+from connectors import list_connectors
+from connectors.base import get_connector
+from websocket.lawyer_connect import (
+    create_room, get_room, list_rooms, close_room,
+    handle_user_websocket, handle_lawyer_websocket,
 )
 from journeys import create_journey, delete_all_journeys, delete_journey, get_journey, list_journeys, rename_journey
 from cache import get_prompt_cache, set_prompt_cache
@@ -69,6 +81,7 @@ class AuthPayload(BaseModel):
     email: str
     password: str
     name: str = ""
+    role: str = "user"
 
 
 class ProfileUpdate(BaseModel):
@@ -137,9 +150,11 @@ def health():
         "stack": {
             "langchain": True,
             "langgraph": True,
-            "streaming": "langgraph.stream",
+            "multi_agent": True,
+            "streaming": "langgraph.stream + multi_agent",
             "query_analyser": True,
             "auth": "mongodb",
+            "roles": ALL_ROLES,
             "memory": ["in_memory", "short_term_redis", "user_thread_mongo", "long_term_mongodb"],
             "prompt_cache": True,
             "rag": True,
@@ -147,7 +162,10 @@ def health():
             "embed_model": os.getenv("GROQ_EMBED_MODEL", "nomic-embed-text-v1.5"),
             "file_store": "mongodb_gridfs",
             "max_upload_mb": MAX_UPLOAD_MB,
+            "websocket_lawyer_connect": True,
         },
+        "agents": list_registered_agents(),
+        "connectors": list_connectors(),
         "memory": layer_status(),
         "qdrant": qdrant_status(),
         "embeddings": embed_status(),
@@ -157,8 +175,8 @@ def health():
 
 @app.post("/auth/register")
 def auth_register(payload: AuthPayload):
-    user = register_user(payload.email, payload.password, payload.name)
-    token = make_token(user["user_id"], user["email"])
+    user = register_user(payload.email, payload.password, payload.name, payload.role)
+    token = make_token(user["user_id"], user["email"], user.get("role") or ROLE_USER)
     journey = create_journey(user["user_id"], "New chat")
     return {"token": token, "user": user, "journey": journey}
 
@@ -166,7 +184,7 @@ def auth_register(payload: AuthPayload):
 @app.post("/auth/login")
 def auth_login(payload: AuthPayload):
     user = login_user(payload.email, payload.password)
-    token = make_token(user["user_id"], user["email"])
+    token = make_token(user["user_id"], user["email"], user.get("role") or ROLE_USER)
     journeys = list_journeys(user["user_id"])
     journey = journeys[0] if journeys else create_journey(user["user_id"], "New chat")
     return {"token": token, "user": user, "journey": journey, "journeys": journeys or [journey]}
@@ -569,3 +587,263 @@ def chat(req: ChatRequest, user: dict = Depends(current_user)):
         "memory": {"layers": loaded["layers"], "writes": writes, "facts": loaded["facts"]},
         "retrieval": {"report": rag_report, "hits": hits},
     }
+
+# ═══════════════════════════════════════════════════════════════
+# MULTI-AGENT CHAT ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/chat/stream/v2")
+def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
+    """Multi-agent streaming chat — uses the root agent + specialist agents."""
+    api_key = require_key()
+    incoming = cleaned_messages(req)
+    journey = resolve_journey(user, req.journey_id or req.session_id)
+    journey_id = journey["journey_id"]
+    user_id = user["user_id"]
+    user_role = user.get("role") or ROLE_USER
+    query = latest_user_text(incoming)
+    loaded = load_all(user_id, journey_id, incoming, query)
+
+    def generate():
+        try:
+            yield sse({"type": "thinking", "text": "Multi-agent pipeline starting…"})
+
+            # RAG search
+            hits, rag_report = search_docs(user_id, query, journey_id)
+            rag_notes = format_hits(hits)
+            yield sse({"type": "retrieval", "report": rag_report, "hits": hits})
+
+            # Stream through multi-agent graph
+            reply_parts: list[str] = []
+            analysis = None
+            routed_to = "assistant"
+
+            for event in stream_multi_graph(
+                loaded["history"],
+                api_key,
+                GROQ_MODEL,
+                memory_notes=loaded["notes"],
+                rag_notes=rag_notes,
+                user_role=user_role,
+            ):
+                if event.get("type") == "agent_route":
+                    routed_to = event.get("routed_to") or "assistant"
+                    analysis = event.get("analysis")
+                    yield sse({
+                        "type": "agent_route",
+                        "routed_to": routed_to,
+                        "analysis": analysis,
+                        "metadata": event.get("agent_metadata") or {},
+                    })
+                    yield sse({"type": "thinking", "text": f"Routed to {routed_to} agent…"})
+                if event.get("type") == "analysis":
+                    analysis = event.get("analysis")
+                    yield sse({"type": "analysis", "analysis": analysis, "model": GROQ_MODEL})
+                if event.get("type") == "token":
+                    reply_parts.append(event.get("content") or "")
+                if event.get("type") == "done":
+                    pass
+                yield sse(event)
+
+            reply = "".join(reply_parts).strip()
+            if reply:
+                # Title + followups
+                title = query[:60]
+                try:
+                    title = suggest_title(query, reply, api_key, GROQ_MODEL)
+                except Exception:
+                    pass
+                followups: list[str] = []
+                try:
+                    followups = suggest_followups(query, reply, api_key, GROQ_MODEL)
+                except Exception:
+                    pass
+
+                stored = loaded["history"] + [{"role": "assistant", "content": reply}]
+                writes = save_all(journey_id, user_id, stored, title or query, reply, analysis)
+                yield sse({
+                    "type": "memory_write",
+                    "writes": writes,
+                    "journey_id": journey_id,
+                    "title": title,
+                })
+                if followups:
+                    yield sse({"type": "followups", "questions": followups})
+                yield sse({"type": "done", "model": GROQ_MODEL, "agent": routed_to})
+        except Exception as exc:
+            yield sse({"type": "error", "detail": f"Multi-agent error: {exc}"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/chat/guest")
+def chat_guest(req: ChatRequest, user: dict | None = Depends(optional_user)):
+    """Guest mode chat — limited to 3 messages, no memory, no file upload."""
+    api_key = require_key()
+    incoming = cleaned_messages(req)
+    if len(incoming) > 6:  # 3 user + 3 assistant = 6
+        raise HTTPException(status_code=403, detail="Guest mode is limited to 3 messages. Please sign up for full access.")
+    query = latest_user_text(incoming)
+
+    try:
+        result_data = {}
+        for event in stream_multi_graph(incoming, api_key, GROQ_MODEL, user_role="guest"):
+            if event.get("type") == "token":
+                result_data["reply"] = event.get("content") or ""
+            if event.get("type") == "agent_route":
+                result_data["routed_to"] = event.get("routed_to")
+                result_data["analysis"] = event.get("analysis")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Error: {exc}") from exc
+
+    reply = (result_data.get("reply") or "").strip()
+    if not reply:
+        raise HTTPException(status_code=502, detail="AI returned an empty reply")
+    return {
+        "reply": reply,
+        "model": GROQ_MODEL,
+        "routed_to": result_data.get("routed_to") or "assistant",
+        "analysis": result_data.get("analysis") or {},
+        "guest_mode": True,
+        "limit": "3 messages — sign up for unlimited access",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONNECTOR ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/connectors")
+def connectors_list():
+    """List all available connectors and their status."""
+    return {"connectors": list_connectors()}
+
+
+@app.get("/connectors/{connector_name}")
+def connector_detail(connector_name: str, query: str = ""):
+    """Get details or search a specific connector."""
+    conn = get_connector(connector_name)
+    if not conn:
+        raise HTTPException(status_code=404, detail=f"Connector '{connector_name}' not found")
+    status = conn.status()
+    if query and hasattr(conn, "search"):
+        results = conn.search(query)
+        return {"status": status, "search": results}
+    return {"status": status}
+
+
+# ═══════════════════════════════════════════════════════════════
+# LAWYER FINDER & WEBSOCKET ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+class LawyerRoomCreate(BaseModel):
+    lawyer_id: str
+    journey_id: str = ""
+
+
+@app.post("/lawyer/rooms")
+def lawyer_room_create(payload: LawyerRoomCreate, user: dict = Depends(current_user)):
+    """Create a real-time chat room between user and lawyer."""
+    room = create_room(user["user_id"], payload.lawyer_id, payload.journey_id)
+    return room
+
+
+@app.get("/lawyer/rooms")
+def lawyer_rooms_list(user: dict = Depends(current_user)):
+    """List all chat rooms for the current user."""
+    return {"rooms": list_rooms(user_id=user["user_id"])}
+
+
+@app.get("/lawyer/rooms/{room_id}")
+def lawyer_room_detail(room_id: str, user: dict = Depends(current_user)):
+    """Get details of a specific chat room."""
+    room = get_room(room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room["user_id"] != user["user_id"] and room["lawyer_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return {
+        "room_id": room["room_id"],
+        "user_id": room["user_id"],
+        "lawyer_id": room["lawyer_id"],
+        "status": room["status"],
+        "message_count": len(room["messages"]),
+    }
+
+
+@app.delete("/lawyer/rooms/{room_id}")
+def lawyer_room_close(room_id: str, user: dict = Depends(current_user)):
+    """Close a lawyer chat room."""
+    room = get_room(room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room["user_id"] != user["user_id"] and room["lawyer_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return close_room(room_id)
+
+
+@app.websocket("/ws/lawyer/user/{room_id}")
+async def ws_lawyer_user(websocket: WebSocket, room_id: str, user_id: str = ""):
+    """WebSocket endpoint for user side of lawyer chat."""
+    if not user_id:
+        await websocket.close(code=4001, reason="user_id required")
+        return
+    await handle_user_websocket(websocket, room_id, user_id)
+
+
+@app.websocket("/ws/lawyer/lawyer/{room_id}")
+async def ws_lawyer_lawyer(websocket: WebSocket, room_id: str, lawyer_id: str = ""):
+    """WebSocket endpoint for lawyer side of lawyer chat."""
+    if not lawyer_id:
+        await websocket.close(code=4001, reason="lawyer_id required")
+        return
+    await handle_lawyer_websocket(websocket, room_id, lawyer_id)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN ENDPOINTS (role-restricted)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/admin/system")
+def admin_system_status(user: dict = Depends(require_role(ROLE_ADMIN))):
+    """Full system status — admin only."""
+    return {
+        "health": {
+            "provider": "groq",
+            "model": GROQ_MODEL,
+            "configured": bool(GROQ_API_KEY),
+        },
+        "agents": list_registered_agents(),
+        "connectors": list_connectors(),
+        "memory": layer_status(),
+        "qdrant": qdrant_status(),
+        "embeddings": embed_status(),
+        "files": files_status(),
+        "roles": ALL_ROLES,
+    }
+
+
+@app.get("/admin/agents")
+def admin_list_agents(user: dict = Depends(require_role(ROLE_ADMIN))):
+    """List all registered agents — admin only."""
+    return {"agents": list_registered_agents()}
+
+
+@app.get("/admin/connectors")
+def admin_list_connectors(user: dict = Depends(require_role(ROLE_ADMIN))):
+    """List all connectors — admin only."""
+    return {"connectors": list_connectors()}
+
+
+# ═══════════════════════════════════════════════════════════════
+# LAWYER-SPECIFIC ENDPOINTS (role-restricted)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/lawyer/my-rooms")
+def lawyer_my_rooms(user: dict = Depends(require_role(ROLE_LAWYER, ROLE_ADMIN))):
+    """List all rooms where this user is the lawyer."""
+    return {"rooms": list_rooms(lawyer_id=user["user_id"])}
