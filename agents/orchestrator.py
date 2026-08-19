@@ -26,14 +26,14 @@ ORCHESTRATOR_PROMPT = """You are the root orchestrator agent for a legal AI assi
 Read the latest user message and return ONLY valid JSON:
 
 {
-  "intent": "question|draft|review|procedure|compare|document|find_lawyer|other",
+  "intent": "question|draft|review|procedure|compare|document|email|find_lawyer|other",
   "domain": "contract|criminal|civil|family|employment|ip|property|tax|constitutional|general",
   "complexity": "simple|medium|complex",
   "jurisdiction": "country or state if mentioned, else unspecified",
   "on_topic": true,
   "summary": "one short sentence describing the user's need",
   "refined_query": "clearer rewrite of the latest user question",
-  "route_to": "assistant|researcher|draft|document_creator|lawyer_finder"
+  "route_to": "assistant|researcher|draft|document_creator|email|lawyer_finder"
 }
 
 Routing rules:
@@ -41,6 +41,7 @@ Routing rules:
 - "question" needing deep case-law / statute research → "researcher"
 - "draft" (write a notice, agreement, letter) → "draft"
 - "document" (create, format, fill a legal document) → "document_creator"
+- "email" (write an email, compose a message) → "email"
 - "review" (review / analyse a contract or document) → "researcher"
 - "procedure" (step-by-step legal process) → "assistant"
 - "compare" (compare laws, options) → "researcher"
@@ -57,6 +58,7 @@ INTENT_AGENT_MAP: dict[str, str] = {
     "procedure": "assistant",
     "compare": "researcher",
     "document": "document_creator",
+    "email": "email",
     "find_lawyer": "lawyer_finder",
     "other": "assistant",
 }
@@ -137,7 +139,7 @@ def decide_route(state: AgentState) -> str:
     """Conditional-edge function used by LangGraph to pick the next node."""
     route = (state.get("routed_to") or "assistant").strip()
     # validate against known agents
-    valid = {"assistant", "researcher", "draft", "document_creator", "lawyer_finder"}
+    valid = {"assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder"}
     return route if route in valid else "assistant"
 
 

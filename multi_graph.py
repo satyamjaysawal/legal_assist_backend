@@ -5,6 +5,7 @@ Architecture:
                    ├──► researcher
                    ├──► draft
                    ├──► document_creator
+                   ├──► email
                    └──► lawyer_finder
 
 Each specialist writes its reply into state["reply"].
@@ -22,6 +23,7 @@ from agents.assistant import assistant_generate
 from agents.researcher import researcher_generate
 from agents.draft import draft_generate
 from agents.document_creator import document_creator_generate
+from agents.email_agent import email_generate
 from agents.lawyer_finder import lawyer_finder_generate
 
 
@@ -36,6 +38,7 @@ def build_multi_graph(api_key: str, model: str):
     graph.add_node("researcher", researcher_generate)
     graph.add_node("draft", draft_generate)
     graph.add_node("document_creator", document_creator_generate)
+    graph.add_node("email", email_generate)
     graph.add_node("lawyer_finder", lawyer_finder_generate)
 
     # ── Edges ───────────────────────────────────────────────────
@@ -50,12 +53,13 @@ def build_multi_graph(api_key: str, model: str):
             "researcher": "researcher",
             "draft": "draft",
             "document_creator": "document_creator",
+            "email": "email",
             "lawyer_finder": "lawyer_finder",
         },
     )
 
     # All specialist agents → END
-    for agent_name in ("assistant", "researcher", "draft", "document_creator", "lawyer_finder"):
+    for agent_name in ("assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder"):
         graph.add_edge(agent_name, END)
 
     return graph.compile()
