@@ -9,6 +9,7 @@ STM_WINDOW = 20
 LTM_LIMIT = 8
 MONGO_DB = os.getenv("MONGODB_DB", "legal_assist_inhouse")
 LTM_COLLECTION = "long_term_memory"
+PROFILE_COLLECTION = "user_profiles"
 
 _in_memory: dict[str, list[dict[str, str]]] = {}
 _redis = None
@@ -475,9 +476,197 @@ def save_all(
     reply: str,
     analysis: dict[str, Any] | None,
 ):
-    return [
+    writes = [
         save_in_memory(user_id, journey_id, messages),
         save_short_term(user_id, journey_id, messages),
         save_thread(user_id, journey_id, messages, query),
         save_long_term(user_id, journey_id, query, reply, analysis),
     ]
+    # Extract and save personal info from the latest user message
+    try:
+        profile_write = extract_and_save_profile(user_id, query)
+        if profile_write:
+            writes.append(profile_write)
+    except Exception:
+        pass
+    return writes
+
+
+# ── User Profile System ──────────────────────────────────────────
+
+# Patterns to extract personal information from user messages
+_NAME_PATTERNS = [
+    re.compile(r"(?:my name is|i'm|i am|call me|this is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", re.IGNORECASE),
+    re.compile(r"(?:name[:\s]+)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", re.IGNORECASE),
+]
+_EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+_PHONE_PATTERN = re.compile(r"(?:\+?\d{1,3}[\s\-]?)?\(?\d{2,5}\)?[\s\-]?\d{3,5}[\s\-]?\d{3,5}")
+_FACT_PATTERNS = [
+    re.compile(r"i (?:live in|am from|reside in)\s+(.+?)(?:\.|$)", re.IGNORECASE),
+    re.compile(r"i (?:work as|am a|am an)\s+(.+?)(?:\.|$)", re.IGNORECASE),
+    re.compile(r"my (?:company|firm|organisation) is\s+(.+?)(?:\.|$)", re.IGNORECASE),
+]
+
+
+def extract_and_save_profile(user_id: str, text: str) -> dict[str, Any] | None:
+    """Extract personal information from user text and update profile."""
+    if not user_id or not text:
+        return None
+    updates: dict[str, Any] = {}
+
+    # Extract name
+    for pat in _NAME_PATTERNS:
+        m = pat.search(text)
+        if m:
+            name = m.group(1).strip()
+            if 2 <= len(name) <= 60:
+                updates["name"] = name
+            break
+
+    # Extract email
+    m = _EMAIL_PATTERN.search(text)
+    if m:
+        updates["email"] = m.group(0)
+
+    # Extract phone
+    m = _PHONE_PATTERN.search(text)
+    if m:
+        phone = m.group(0).strip()
+        if len(phone) >= 8:
+            updates["phone"] = phone
+
+    # Extract facts (location, profession, etc.)
+    for pat in _FACT_PATTERNS:
+        m = pat.search(text)
+        if m:
+            fact = m.group(0).strip().lower()
+            if "facts" not in updates:
+                updates["facts"] = []
+            updates["facts"].append(fact)
+
+    if not updates:
+        return None
+
+    client = get_mongo()
+    if client is None:
+        return None
+
+    try:
+        col = client[MONGO_DB][PROFILE_COLLECTION]
+        existing = col.find_one({"user_id": user_id}, {"_id": 0}) or {}
+
+        # Merge updates into existing profile
+        for key, value in updates.items():
+            if key == "facts":
+                old_facts = set(existing.get("facts") or [])
+                old_facts.update(value)
+                existing["facts"] = list(old_facts)[-20:]  # keep last 20
+            else:
+                existing[key] = value
+
+        existing["user_id"] = user_id
+        existing["updated_at"] = _now()
+        if "created_at" not in existing:
+            existing["created_at"] = _now()
+
+        col.update_one(
+            {"user_id": user_id},
+            {"$set": existing},
+            upsert=True,
+        )
+        return {
+            "name": "profile",
+            "label": "User profile",
+            "store": "MongoDB",
+            "wrote": True,
+            "when": _now(),
+            "detail": f"Updated profile: {list(updates.keys())}",
+        }
+    except Exception as exc:
+        return {
+            "name": "profile",
+            "label": "User profile",
+            "store": "MongoDB",
+            "wrote": False,
+            "detail": str(exc),
+        }
+
+
+def load_user_profile(user_id: str) -> tuple[str, dict[str, Any]]:
+    """Load user profile and return (formatted_text, raw_profile)."""
+    report = {
+        "name": "profile",
+        "label": "User profile",
+        "store": "MongoDB",
+        "used": False,
+        "status": "miss",
+        "when": _now(),
+        "detail": "No profile",
+    }
+    if not user_id:
+        return "", report
+    client = get_mongo()
+    if client is None:
+        report["status"] = "error"
+        report["detail"] = _mongo_error or "MongoDB unavailable"
+        return "", report
+    try:
+        col = client[MONGO_DB][PROFILE_COLLECTION]
+        profile = col.find_one({"user_id": user_id}, {"_id": 0})
+        if not profile:
+            return "", report
+
+        parts = []
+        if profile.get("name"):
+            parts.append(f"User's name: {profile['name']}")
+        if profile.get("email"):
+            parts.append(f"Email: {profile['email']}")
+        if profile.get("phone"):
+            parts.append(f"Phone: {profile['phone']}")
+        for fact in (profile.get("facts") or []):
+            parts.append(fact.capitalize())
+
+        text = "\n".join(parts) if parts else ""
+        report["used"] = bool(text)
+        report["status"] = "hit" if text else "miss"
+        report["detail"] = f"Profile: {profile.get('name', 'unknown')}" if text else "Empty profile"
+        return text, report
+    except Exception as exc:
+        report["status"] = "error"
+        report["detail"] = str(exc)
+        return "", report
+
+
+def get_user_profile(user_id: str) -> dict[str, Any] | None:
+    """Get raw user profile document."""
+    if not user_id:
+        return None
+    client = get_mongo()
+    if client is None:
+        return None
+    try:
+        return client[MONGO_DB][PROFILE_COLLECTION].find_one(
+            {"user_id": user_id}, {"_id": 0}
+        )
+    except Exception:
+        return None
+
+
+def update_user_profile(user_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    """Manually update user profile fields."""
+    if not user_id:
+        return {"ok": False, "detail": "No user_id"}
+    client = get_mongo()
+    if client is None:
+        return {"ok": False, "detail": "MongoDB unavailable"}
+    try:
+        col = client[MONGO_DB][PROFILE_COLLECTION]
+        updates["updated_at"] = _now()
+        col.update_one(
+            {"user_id": user_id},
+            {"$set": updates},
+            upsert=True,
+        )
+        return {"ok": True, "updated": list(updates.keys())}
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}

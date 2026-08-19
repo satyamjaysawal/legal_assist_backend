@@ -75,6 +75,11 @@ def email_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             f"- summary: {analysis.get('summary', '')}"
         )
 
+    # Inject user profile
+    profile = (state.get("user_profile") or "").strip()
+    if profile:
+        system += "\n\nUser profile (use for signature/sender):\n" + profile
+
     notes = (state.get("memory_notes") or "").strip()
     if notes:
         system += "\n\nUser context:\n" + notes

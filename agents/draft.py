@@ -58,6 +58,11 @@ def draft_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             f"- summary: {analysis.get('summary', '')}"
         )
 
+    # Inject user profile
+    profile = (state.get("user_profile") or "").strip()
+    if profile:
+        system += "\n\nUser profile (use for placeholders):\n" + profile
+
     # Inject memory
     notes = (state.get("memory_notes") or "").strip()
     if notes:

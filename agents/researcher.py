@@ -58,6 +58,11 @@ def researcher_generate(state: AgentState, config: RunnableConfig) -> dict[str, 
             f"- refined_query: {analysis.get('refined_query', '')}"
         )
 
+    # Inject user profile
+    profile = (state.get("user_profile") or "").strip()
+    if profile:
+        system += "\n\nUser profile:\n" + profile
+
     # Inject memory
     notes = (state.get("memory_notes") or "").strip()
     if notes:

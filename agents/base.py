@@ -13,6 +13,7 @@ class AgentState(TypedDict, total=False):
     reply: str
     memory_notes: str
     rag_notes: str
+    user_profile: str
     active_agent: str
     routed_to: str
     agent_metadata: dict[str, Any]
@@ -57,7 +58,7 @@ def get_llm(api_key: str, model: str, temperature: float = 0.4) -> ChatGroq:
         api_key=api_key,
         model=model,
         temperature=temperature,
-        max_tokens=1024,
+        max_tokens=2048,
         streaming=True,
     )
 

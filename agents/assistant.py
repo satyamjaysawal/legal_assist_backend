@@ -59,6 +59,12 @@ def assistant_generate(state: AgentState, config: RunnableConfig) -> dict[str, A
             f"- summary: {analysis.get('summary', '')}"
         )
 
+    # Inject user profile
+    profile = (state.get("user_profile") or "").strip()
+    if profile:
+        system += "\n\n=== USER PROFILE (use this to personalize responses) ===\n" + profile
+        system += "\nIMPORTANT: If the user shared their name, USE IT in your response."
+
     # Inject memory notes
     notes = (state.get("memory_notes") or "").strip()
     if notes:

@@ -102,6 +102,11 @@ def lawyer_finder_generate(state: AgentState, config: RunnableConfig) -> dict[st
         "who have 'available_for_chat: true'."
     )
 
+    # Inject user profile
+    profile = (state.get("user_profile") or "").strip()
+    if profile:
+        system += "\n\nUser profile:\n" + profile
+
     if analysis:
         system += (
             f"\n\nUser's legal need:\n"

@@ -36,7 +36,15 @@ from cache import get_prompt_cache, set_prompt_cache
 from docs import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, chunk_text, parse_file
 from embeddings import embed_status
 from files import files_status, get_original_file, store_original_file
-from memory import layer_status, list_user_facts, load_all, save_all
+from memory import (
+    get_user_profile,
+    layer_status,
+    list_user_facts,
+    load_all,
+    load_user_profile,
+    save_all,
+    update_user_profile,
+)
 from vectordb import (
     delete_doc,
     format_hits,
@@ -260,6 +268,7 @@ def memory_detail(journey_id: str = "", user: dict = Depends(current_user)):
     loaded = None
     if journey_id:
         loaded = load_all(user["user_id"], journey_id, [], "")
+    profile_text, profile_report = load_user_profile(user["user_id"])
     return {
         "user_id": user["user_id"],
         "journey_id": journey_id,
@@ -272,6 +281,8 @@ def memory_detail(journey_id: str = "", user: dict = Depends(current_user)):
         "qdrant": qdrant_status(),
         "embeddings": embed_status(),
         "files": files_status(),
+        "profile": get_user_profile(user["user_id"]),
+        "profile_text": profile_text,
     }
 
 
@@ -631,6 +642,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
     user_role = user.get("role") or ROLE_USER
     query = latest_user_text(incoming)
     loaded = load_all(user_id, journey_id, incoming, query)
+    profile_text, _ = load_user_profile(user_id)
 
     def generate():
         try:
@@ -676,6 +688,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                 memory_notes=loaded["notes"],
                 rag_notes=rag_notes,
                 user_role=user_role,
+                user_profile=profile_text,
             ):
                 if event.get("type") == "agent_route":
                     routed_to = event.get("routed_to") or "assistant"
@@ -757,7 +770,7 @@ def chat_guest(req: ChatRequest, user: dict | None = Depends(optional_user)):
 
     try:
         result_data = {}
-        for event in stream_multi_graph(incoming, api_key, GROQ_MODEL, user_role="guest"):
+        for event in stream_multi_graph(incoming, api_key, GROQ_MODEL, user_role="guest", user_profile=""):
             if event.get("type") == "token":
                 result_data["reply"] = event.get("content") or ""
             if event.get("type") == "agent_route":
@@ -777,6 +790,58 @@ def chat_guest(req: ChatRequest, user: dict | None = Depends(optional_user)):
         "guest_mode": True,
         "limit": "3 messages — sign up for unlimited access",
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# USER PROFILE ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+class ProfileUpdateRequest(BaseModel):
+    name: str = ""
+    email: str = ""
+    phone: str = ""
+    facts: list[str] = []
+
+
+@app.get("/memory/profile")
+def memory_profile_get(user: dict = Depends(current_user)):
+    """Get user profile."""
+    profile = get_user_profile(user["user_id"])
+    return {"profile": profile or {}}
+
+
+@app.put("/memory/profile")
+def memory_profile_put(req: ProfileUpdateRequest, user: dict = Depends(current_user)):
+    """Update user profile."""
+    updates = {}
+    if req.name:
+        updates["name"] = req.name
+    if req.email:
+        updates["email"] = req.email
+    if req.phone:
+        updates["phone"] = req.phone
+    if req.facts:
+        updates["facts"] = req.facts
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    result = update_user_profile(user["user_id"], updates)
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=result.get("detail") or "Failed to update profile")
+    return {"updated": result.get("updated"), "profile": get_user_profile(user["user_id"])}
+
+
+@app.delete("/memory/profile")
+def memory_profile_delete(user: dict = Depends(current_user)):
+    """Delete user profile."""
+    from memory import get_mongo, MONGO_DB, PROFILE_COLLECTION
+    client = get_mongo()
+    if client is None:
+        raise HTTPException(status_code=500, detail="MongoDB unavailable")
+    try:
+        client[MONGO_DB][PROFILE_COLLECTION].delete_one({"user_id": user["user_id"]})
+        return {"deleted": True}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ═══════════════════════════════════════════════════════════════
