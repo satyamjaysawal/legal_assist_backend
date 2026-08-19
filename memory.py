@@ -563,11 +563,23 @@ def save_all(
 
 # ── User Profile System ──────────────────────────────────────────
 
-# Patterns to extract personal information from user messages
+# Patterns to extract personal information from user messages.
+# Note: `i'(?=\s)` catches "I' rahul" (apostrophe + space) but not "i'll";
+# the lookahead after "this is" avoids capturing filler phrases.
 _NAME_PATTERNS = [
-    re.compile(r"(?:my name is|i'm|i am|call me|this is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", re.IGNORECASE),
-    re.compile(r"(?:name[:\s]+)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", re.IGNORECASE),
+    re.compile(
+        r"(?:my name is|i'm|i am|i'(?=\s)|call me"
+        r"|this is(?!\s+(?:not|a|an|the|my|your|his|her|our|their|why|how|what|when|where|who|just|still|very)\b))"
+        r"\s*([A-Za-z][a-z]+(?:\s+[A-Za-z][a-z]+)?)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:name[:\s]+)\s*([A-Za-z][a-z]+(?:\s+[A-Za-z][a-z]+)?)", re.IGNORECASE),
 ]
+# Words that look like name matches but are ordinary replies.
+_NOT_NAMES = {
+    "fine", "good", "okay", "ok", "here", "there", "not", "sure", "happy",
+    "ready", "back", "done", "sorry", "confused", "stuck", "new", "alone",
+}
 _EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 _PHONE_PATTERN = re.compile(r"(?:\+?\d{1,3}[\s\-]?)?\(?\d{2,5}\)?[\s\-]?\d{3,5}[\s\-]?\d{3,5}")
 _FACT_PATTERNS = [
@@ -588,7 +600,7 @@ def extract_and_save_profile(user_id: str, text: str) -> dict[str, Any] | None:
         m = pat.search(text)
         if m:
             name = m.group(1).strip()
-            if 2 <= len(name) <= 60:
+            if 2 <= len(name) <= 60 and name.lower() not in _NOT_NAMES:
                 updates["name"] = name
             break
 

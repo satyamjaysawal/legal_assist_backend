@@ -13,6 +13,10 @@ from memory import get_redis
 logger = logging.getLogger("legal_assist.cache")
 
 PROMPT_CACHE_TTL = int(os.getenv("PROMPT_CACHE_TTL", "21600"))
+# Master switch for the semantic (embedding-similarity) cache layer.
+# Disabled by default: identity-style questions must reach the memory
+# layer, and exact-match caching already covers repeated prompts.
+SEMANTIC_CACHE_ENABLED = os.getenv("SEMANTIC_CACHE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.55"))
 # Queries that reduce to fewer content tokens than this are too generic
 # to cache semantically (e.g. "who am I", "help") — they would match
@@ -30,6 +34,25 @@ def _now() -> str:
 
 def normalize_prompt(query: str) -> str:
     return re.sub(r"\s+", " ", (query or "").strip().lower())
+
+
+# Personal / identity questions depend on per-user memory (profile facts,
+# prior turns), so they must NEVER be served from or stored in the shared
+# prompt cache — a cached answer would ignore what the bot knows about
+# this specific user.
+_PERSONAL_PATTERNS = [
+    r"\bwho\s+(?:am\s+i|i\s+am|i'?m\s+i)\b",
+    r"\bwhat(?:'s|\s+is)?\s+my\s+name\b",
+    r"\bdo\s+you\s+(?:know|remember)\s+me\b",
+    r"\b(?:tell\s+me\s+)?about\s+me\b",
+    r"\bmy\s+identity\b",
+    r"\bremember\s+(?:about\s+)?me\b",
+]
+
+
+def is_personal_query(query: str) -> bool:
+    norm = normalize_prompt(query)
+    return any(re.search(p, norm) for p in _PERSONAL_PATTERNS)
 
 
 def prompt_cache_id(query: str, model: str, extra: str = "") -> str:
@@ -65,6 +88,10 @@ def get_prompt_cache(query: str, model: str, extra: str = "") -> tuple[dict[str,
         "when": _now(),
         "detail": "No cached answer for this prompt",
     }
+    if is_personal_query(query):
+        report["detail"] = "Personal query — cache bypassed so memory can answer"
+        logger.info("Exact cache BYPASS (personal query): %r", query[:80])
+        return None, report
     local = _local.get(key)
     if local:
         report.update(
@@ -100,6 +127,15 @@ def get_prompt_cache(query: str, model: str, extra: str = "") -> tuple[dict[str,
 
 
 def set_prompt_cache(query: str, model: str, payload: dict[str, Any], extra: str = "") -> dict[str, Any]:
+    if is_personal_query(query):
+        return {
+            "name": "prompt_cache",
+            "label": "Prompt cache",
+            "wrote": False,
+            "store": None,
+            "when": _now(),
+            "detail": "Personal query — never cached (memory-dependent answer)",
+        }
     key = prompt_cache_key(query, model, extra)
     body = {
         "query": query,
@@ -180,6 +216,9 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
         "when": _now(),
         "detail": "No semantically similar cached query",
     }
+    if not SEMANTIC_CACHE_ENABLED:
+        report.update(status="skip", detail="Semantic cache disabled (SEMANTIC_CACHE_ENABLED=false)")
+        return None, report
     index = _load_sem_index()
     if not index:
         report["detail"] = "Semantic index empty — first query stores it"
@@ -273,6 +312,9 @@ def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, A
         "when": _now(),
         "detail": "",
     }
+    if not SEMANTIC_CACHE_ENABLED:
+        report["detail"] = "Semantic cache disabled (SEMANTIC_CACHE_ENABLED=false)"
+        return report
     try:
         from embeddings import embed_texts
 

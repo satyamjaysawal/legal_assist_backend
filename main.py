@@ -34,7 +34,13 @@ from websocket.lawyer_connect import (
     handle_user_websocket, handle_lawyer_websocket,
 )
 from journeys import create_journey, delete_all_journeys, delete_journey, get_journey, list_journeys, rename_journey
-from cache import get_prompt_cache, set_prompt_cache, semantic_cache_lookup, semantic_cache_store
+from cache import (
+    SEMANTIC_CACHE_ENABLED,
+    get_prompt_cache,
+    set_prompt_cache,
+    semantic_cache_lookup,
+    semantic_cache_store,
+)
 from docs import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, chunk_text, parse_file
 from embeddings import embed_status
 from files import files_status, get_original_file, store_original_file
@@ -727,16 +733,20 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                 exact_report.get("detail") or ("Exact match found" if cached else "No exact-match cache entry"),
             )
             if not cached:
-                yield sse({"type": "thinking", "text": "Checking semantic cache (embedding similarity)…"})
-                sem_cached, sem_report = semantic_cache_lookup(query, GROQ_MODEL)
-                yield step(
-                    "cache_semantic",
-                    sem_report.get("status") or "miss",
-                    sem_report.get("detail") or "Semantic cache lookup",
-                )
-                logger.info("Semantic cache %s | %s", sem_report.get("status"), sem_report.get("detail"))
-                if sem_cached and sem_cached.get("reply"):
-                    cached = sem_cached
+                if SEMANTIC_CACHE_ENABLED:
+                    yield sse({"type": "thinking", "text": "Checking semantic cache (embedding similarity)…"})
+                    sem_cached, sem_report = semantic_cache_lookup(query, GROQ_MODEL)
+                    yield step(
+                        "cache_semantic",
+                        sem_report.get("status") or "miss",
+                        sem_report.get("detail") or "Semantic cache lookup",
+                    )
+                    logger.info("Semantic cache %s | %s", sem_report.get("status"), sem_report.get("detail"))
+                    if sem_cached and sem_cached.get("reply"):
+                        cached = sem_cached
+                else:
+                    yield step("cache_semantic", "skip", "Semantic cache disabled (SEMANTIC_CACHE_ENABLED=false)")
+                    logger.info("Semantic cache disabled — lookup skipped")
 
             if cached and cached.get("reply"):
                 analysis = cached.get("analysis") or DEFAULT_ANALYSIS
@@ -858,14 +868,23 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     logger.warning("Follow-up generation failed")
                     yield step("followups", "skip", "Could not generate follow-ups")
 
-                # ── Store exact + semantic cache entries ──
-                yield step("cache_write", "running", "Storing exact + semantic cache entries…")
+                # ── Store exact (+ semantic when enabled) cache entries ──
+                yield step("cache_write", "running", "Storing cache entries…")
                 exact_write = set_prompt_cache(
                     query,
                     GROQ_MODEL,
                     {"reply": reply, "analysis": analysis or DEFAULT_ANALYSIS, "followups": followups, "title": title},
                 )
-                sem_write = semantic_cache_store(query, GROQ_MODEL)
+                if SEMANTIC_CACHE_ENABLED:
+                    sem_write = semantic_cache_store(query, GROQ_MODEL)
+                else:
+                    sem_write = {
+                        "name": "semantic_cache",
+                        "label": "Semantic cache",
+                        "wrote": False,
+                        "when": exact_write.get("when"),
+                        "detail": "Semantic cache disabled",
+                    }
                 yield step(
                     "cache_write",
                     "done",
