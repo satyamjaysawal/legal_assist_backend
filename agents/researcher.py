@@ -10,6 +10,7 @@ from langchain_core.runnables import RunnableConfig
 
 from agents.base import (
     AgentState,
+    invoke_text,
     latest_user_text,
     register_agent,
     to_lc_messages,
@@ -91,11 +92,7 @@ def researcher_generate(state: AgentState, config: RunnableConfig) -> dict[str, 
         system += "\n\n=== CONNECTOR DATA ===\n" + str(connector_data)
 
     llm = _get_llm(api_key, model)
-    result = llm.invoke(
-        to_lc_messages(state.get("messages") or [], system),
-        config=config,
-    )
-    reply = str(result.content or "").strip()
+    reply = invoke_text(llm, to_lc_messages(state.get("messages") or [], system), config)
 
     return {
         "reply": reply,

@@ -14,6 +14,7 @@ from langchain_core.runnables import RunnableConfig
 from agents.base import (
     AgentState,
     DEFAULT_ANALYSIS,
+    invoke_text,
     latest_user_text,
     register_agent,
     to_lc_messages,
@@ -112,12 +113,13 @@ def analyse_and_route(state: AgentState, config: RunnableConfig) -> dict[str, An
     user_text = latest_user_text(state.get("messages") or [])
     analyser = _get_analyser_llm(api_key, model)
 
-    result = analyser.invoke(
+    raw = invoke_text(
+        analyser,
         to_lc_messages((state.get("messages") or [])[-6:], ORCHESTRATOR_PROMPT),
-        config=config,
+        config,
     )
 
-    analysis = parse_analysis(str(result.content or ""), user_text)
+    analysis = parse_analysis(raw, user_text)
     route_to = analysis.get("route_to") or "assistant"
 
     return {

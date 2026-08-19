@@ -1,5 +1,6 @@
 """Base types, shared state definition, and agent registry."""
 
+import time
 from typing import Any, Callable, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -107,3 +108,25 @@ def unpack_stream_part(part: Any) -> tuple[str | None, Any]:
     if isinstance(part, tuple) and len(part) == 2:
         return part[0], part[1]
     return None, None
+
+
+def invoke_text(llm, messages, config: Optional[dict] = None, retries: int = 2) -> str:
+    """Invoke an LLM with retry and robust text extraction.
+
+    Retries on exceptions or empty content (Groq occasionally returns
+    empty/reasoning-only payloads).  Raises the last error if all
+    attempts fail.
+    """
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            result = llm.invoke(messages, config=config) if config else llm.invoke(messages)
+            text = message_text(result).strip()
+            if text:
+                return text
+            last_error = RuntimeError("LLM returned empty content")
+        except Exception as exc:  # noqa: BLE001 — retry on any provider error
+            last_error = exc
+        if attempt < retries:
+            time.sleep(1.0 * (attempt + 1))
+    raise last_error or RuntimeError("LLM returned empty content")

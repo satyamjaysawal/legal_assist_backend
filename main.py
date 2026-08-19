@@ -32,7 +32,7 @@ from websocket.lawyer_connect import (
     handle_user_websocket, handle_lawyer_websocket,
 )
 from journeys import create_journey, delete_all_journeys, delete_journey, get_journey, list_journeys, rename_journey
-from cache import get_prompt_cache, set_prompt_cache
+from cache import get_prompt_cache, set_prompt_cache, semantic_cache_lookup, semantic_cache_store
 from docs import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, chunk_text, parse_file
 from embeddings import embed_status
 from files import files_status, get_original_file, store_original_file
@@ -697,6 +697,56 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
     
             yield sse({"type": "thinking", "text": "Multi-agent pipeline starting…"})
             yield step("memory", "done", f"{len(loaded['layers'])} memory layer(s) · {len(loaded['facts'])} fact(s) loaded")
+            yield sse({
+                "type": "memory",
+                "user_id": user_id,
+                "journey_id": journey_id,
+                "session_id": journey_id,
+                "layers": loaded["layers"],
+                "facts": loaded["facts"],
+            })
+
+            # ── Two-layer prompt cache: exact match, then semantic match ──
+            yield sse({"type": "thinking", "text": "Checking exact-match cache…"})
+            cached, exact_report = get_prompt_cache(query, GROQ_MODEL)
+            yield sse({"type": "cache", "report": exact_report})
+            yield step(
+                "cache_exact",
+                "hit" if cached else "miss",
+                exact_report.get("detail") or ("Exact match found" if cached else "No exact-match cache entry"),
+            )
+            if not cached:
+                yield sse({"type": "thinking", "text": "Checking semantic cache (embedding similarity)…"})
+                sem_cached, sem_report = semantic_cache_lookup(query, GROQ_MODEL)
+                yield step(
+                    "cache_semantic",
+                    sem_report.get("status") or "miss",
+                    sem_report.get("detail") or "Semantic cache lookup",
+                )
+                if sem_cached and sem_cached.get("reply"):
+                    cached = sem_cached
+
+            if cached and cached.get("reply"):
+                analysis = cached.get("analysis") or DEFAULT_ANALYSIS
+                routed = analysis.get("route_to") or "assistant"
+                yield step(
+                    "orchestrator",
+                    "done",
+                    f"intent={analysis.get('intent')} · domain={analysis.get('domain')} · "
+                    f"complexity={analysis.get('complexity')} → cached route to {routed}",
+                )
+                yield sse({"type": "agent_route", "routed_to": routed, "analysis": analysis, "metadata": {}})
+                yield sse({"type": "analysis", "analysis": analysis, "model": GROQ_MODEL, "cached": True})
+                yield step(routed, "done", "Reply served from cache — no LLM call")
+                yield sse({"type": "token", "content": cached["reply"]})
+                stored = loaded["history"] + [{"role": "assistant", "content": cached["reply"]}]
+                writes = save_all(journey_id, user_id, stored, cached.get("title") or query, cached["reply"], analysis)
+                yield step("memory_write", "done", f"{sum(1 for w in writes if w.get('wrote'))} memory store(s) updated")
+                yield sse({"type": "memory_write", "writes": writes, "journey_id": journey_id, "title": cached.get("title") or ""})
+                if cached.get("followups"):
+                    yield sse({"type": "followups", "questions": cached["followups"]})
+                yield sse({"type": "done", "model": GROQ_MODEL, "agent": routed, "cached": True})
+                return
     
             if compression_report.get("used"):
                 yield step(
@@ -787,6 +837,32 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     yield step("followups", "done", f"{len(followups)} question(s) generated from query + reply")
                 except Exception:
                     yield step("followups", "skip", "Could not generate follow-ups")
+
+                # ── Store exact + semantic cache entries ──
+                yield step("cache_write", "running", "Storing exact + semantic cache entries…")
+                exact_write = set_prompt_cache(
+                    query,
+                    GROQ_MODEL,
+                    {"reply": reply, "analysis": analysis or DEFAULT_ANALYSIS, "followups": followups, "title": title},
+                )
+                sem_write = semantic_cache_store(query, GROQ_MODEL)
+                yield step(
+                    "cache_write",
+                    "done",
+                    f"exact: {exact_write.get('detail')} · semantic: {sem_write.get('detail')}",
+                )
+                yield sse({
+                    "type": "cache_write",
+                    "report": {
+                        "name": "cache_write",
+                        "label": "Cache save",
+                        "wrote": True,
+                        "when": sem_write.get("when") or exact_write.get("when"),
+                        "detail": f"exact: {exact_write.get('detail')} · semantic: {sem_write.get('detail')}",
+                        "exact": exact_write,
+                        "semantic": sem_write,
+                    },
+                })
     
                 stored = loaded["history"] + [{"role": "assistant", "content": reply}]
                 writes = save_all(journey_id, user_id, stored, title or query, reply, analysis)
