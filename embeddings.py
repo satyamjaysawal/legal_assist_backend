@@ -106,7 +106,8 @@ def _tokenize(text: str) -> list[str]:
             t[:-1] if len(t) > 3 and t.endswith("s") else t
         )
         t = _SYNONYMS.get(t, t)
-        if t not in _STOPWORDS:
+        # drop stopwords and single-char noise (e.g. "m" from "I'm")
+        if t not in _STOPWORDS and len(t) >= 2:
             tokens.append(t)
     return tokens
 
@@ -184,7 +185,12 @@ def embed_texts(texts: list[str], kind: str = "document") -> tuple[list[list[flo
     except Exception as exc:
         _last_error = str(exc)
         logger.warning("FastEmbed unavailable (%s); using deterministic hash embeddings", exc)
-    vectors = _hash_embed(prepared)
+    # Hash fallback must use RAW text: the "search_query:/search_document:"
+    # prefix is meaningful to real embedding models but would add identical
+    # tokens to every hash vector, inflating similarity for short texts and
+    # causing semantic-cache false positives.
+    raw_texts = [text for text in texts if (text or "").strip()]
+    vectors = _hash_embed(raw_texts)
     _provider = "hash"
     report.update(
         provider="hash",
