@@ -82,7 +82,7 @@ def _get_llm(api_key: str, model: str):
 def lawyer_finder_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     """Find and present lawyer options to the user."""
     api_key = config.get("configurable", {}).get("api_key", "")
-    model = config.get("configurable", {}).get("model", "llama-3.3-70b-versatile")
+    model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
 
     analysis = state.get("analysis") or {}
     domain = analysis.get("domain", "general")

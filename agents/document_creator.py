@@ -53,7 +53,7 @@ def _get_llm(api_key: str, model: str):
 def document_creator_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     """Generate a structured legal document."""
     api_key = config.get("configurable", {}).get("api_key", "")
-    model = config.get("configurable", {}).get("model", "llama-3.3-70b-versatile")
+    model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
 
     analysis = state.get("analysis") or {}
     system = DOC_CREATOR_SYSTEM

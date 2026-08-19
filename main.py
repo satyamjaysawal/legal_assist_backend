@@ -53,7 +53,7 @@ load_dotenv(ROOT / ".env")
 load_dotenv(ROOT.parent / "legal_assist" / ".env")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 app = FastAPI(title="Legal AI Assistant")
 

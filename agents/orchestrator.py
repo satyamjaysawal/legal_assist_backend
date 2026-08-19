@@ -105,7 +105,7 @@ def analyse_and_route(state: AgentState, config: RunnableConfig) -> dict[str, An
     """Root agent node: analyse intent and decide routing."""
     # Retrieve api_key and model from config
     api_key = config.get("configurable", {}).get("api_key", "")
-    model = config.get("configurable", {}).get("model", "llama-3.3-70b-versatile")
+    model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
 
     user_text = latest_user_text(state.get("messages") or [])
     analyser = _get_analyser_llm(api_key, model)
