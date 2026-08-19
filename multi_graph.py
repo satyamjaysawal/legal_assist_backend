@@ -78,10 +78,13 @@ def stream_multi_graph(
 ) -> Iterator[dict[str, Any]]:
     """Stream events from the multi-agent graph.
 
-    Yields events with types:
-      - agent_route: which agent was selected
-      - analysis: orchestrator analysis result
-      - token: generated text tokens (when available)
+    Uses LangGraph ``stream_mode="updates"`` so every node completion is
+    surfaced to the caller.  Yields events with types:
+      - agent_route: root agent finished — which specialist was selected
+      - analysis: orchestrator intent classification result
+      - agent_start: a specialist agent begins generating
+      - agent_done: a specialist agent finished generating
+      - token: the final reply text
       - done: generation complete
       - error: something went wrong
     """
@@ -94,9 +97,9 @@ def stream_multi_graph(
     }
 
     try:
-        # Use invoke (non-streaming) for reliable state tracking
-        # Each specialist agent writes to state["reply"]
-        result = compiled.invoke(
+        routed_to = "assistant"
+        reply = ""
+        for update in compiled.stream(
             {
                 "messages": messages,
                 "analysis": None,
@@ -113,25 +116,30 @@ def stream_multi_graph(
                 "connectors_available": [],
             },
             config=config,
-        )
+            stream_mode="updates",
+        ):
+            for node_name, node_state in (update or {}).items():
+                if node_name == "orchestrator":
+                    routed_to = node_state.get("routed_to") or "assistant"
+                    analysis = node_state.get("analysis") or {}
+                    yield {
+                        "type": "agent_route",
+                        "routed_to": routed_to,
+                        "analysis": analysis,
+                        "active_agent": "orchestrator",
+                        "agent_metadata": node_state.get("agent_metadata") or {},
+                    }
+                    if analysis:
+                        yield {"type": "analysis", "analysis": analysis, "model": model}
+                    yield {"type": "agent_start", "agent": routed_to}
+                else:
+                    reply = (node_state.get("reply") or "").strip()
+                    yield {
+                        "type": "agent_done",
+                        "agent": node_name,
+                        "reply_chars": len(reply),
+                    }
 
-        # Emit routing event
-        routed_to = result.get("routed_to") or "assistant"
-        yield {
-            "type": "agent_route",
-            "routed_to": routed_to,
-            "analysis": result.get("analysis") or {},
-            "active_agent": result.get("active_agent") or routed_to,
-            "agent_metadata": result.get("agent_metadata") or {},
-        }
-
-        # Emit analysis
-        analysis = result.get("analysis") or {}
-        if analysis:
-            yield {"type": "analysis", "analysis": analysis, "model": model}
-
-        # Emit the reply as a single token event
-        reply = (result.get("reply") or "").strip()
         if reply:
             yield {"type": "token", "content": reply}
             yield {"type": "done", "model": model, "agent": routed_to}

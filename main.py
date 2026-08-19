@@ -660,6 +660,15 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
 
     def generate():
         try:
+            flow: list[dict] = []
+    
+            def step(name, status, detail=""):
+                """Emit a pipeline step (replaces any earlier step with the same name)."""
+                item = {"name": name, "status": status, "detail": detail}
+                flow[:] = [f for f in flow if f["name"] != name]
+                flow.append(item)
+                return sse({"type": "flow", "steps": flow[:], "current": name})
+    
             # ── Greeting fast-path ──
             if _is_simple_greeting(query):
                 reply = _GREETING_REPLY
@@ -668,33 +677,53 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     "jurisdiction": "unspecified", "on_topic": True,
                     "summary": "Greeting", "refined_query": query, "route_to": "assistant",
                 }
+                yield step("fast_path", "done", "Greeting detected — instant reply, no LLM call")
                 yield sse({"type": "agent_route", "routed_to": "assistant", "analysis": analysis, "metadata": {}})
                 yield sse({"type": "analysis", "analysis": analysis, "model": GROQ_MODEL})
                 yield sse({"type": "token", "content": reply})
                 stored = loaded["history"] + [{"role": "assistant", "content": reply}]
                 writes = save_all(journey_id, user_id, stored, "Greeting", reply, analysis)
+                yield step("memory_write", "done", f"{sum(1 for w in writes if w.get('wrote'))} memory store(s) updated")
                 yield sse({"type": "memory_write", "writes": writes, "journey_id": journey_id, "title": "Greeting"})
                 followups = [
                     "Can you help me draft a lease agreement?",
                     "What are the steps to file a small claims case?",
                     "What should I know about my tenant rights?",
                 ]
+                yield step("followups", "done", f"{len(followups)} canned suggestions (fast-path)")
                 yield sse({"type": "followups", "questions": followups})
                 yield sse({"type": "done", "model": GROQ_MODEL, "agent": "assistant"})
                 return
     
-            yield sse({"type": "thinking", "text": "Multi-agent pipeline starting\u2026"})
-
+            yield sse({"type": "thinking", "text": "Multi-agent pipeline starting…"})
+            yield step("memory", "done", f"{len(loaded['layers'])} memory layer(s) · {len(loaded['facts'])} fact(s) loaded")
+    
+            if compression_report.get("used"):
+                yield step(
+                    "compress",
+                    "done",
+                    compression_report.get("detail") or "Old messages summarised to save tokens",
+                )
+    
             # RAG search
+            yield sse({"type": "thinking", "text": "Searching uploaded documents (RAG)…"})
             hits, rag_report = search_docs(user_id, query, journey_id)
             rag_notes = format_hits(hits)
+            yield step(
+                "rag",
+                "hit" if hits else "miss",
+                f"{len(hits)} document chunk(s) matched in Qdrant" if hits else "No relevant documents found",
+            )
             yield sse({"type": "retrieval", "report": rag_report, "hits": hits})
-
+    
             # Stream through multi-agent graph
             reply_parts: list[str] = []
             analysis = None
             routed_to = "assistant"
-
+    
+            yield sse({"type": "thinking", "text": "Root agent classifying intent…"})
+            yield step("orchestrator", "running", "Root agent reading query → intent · domain · complexity")
+    
             for event in stream_multi_graph(
                 loaded["history"],
                 api_key,
@@ -706,9 +735,17 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                 episodic_notes=loaded.get("episodic_notes", ""),
                 procedural_notes=loaded.get("procedural_notes", ""),
             ):
-                if event.get("type") == "agent_route":
+                etype = event.get("type")
+                if etype == "agent_route":
                     routed_to = event.get("routed_to") or "assistant"
                     analysis = event.get("analysis")
+                    a = analysis or {}
+                    yield step(
+                        "orchestrator",
+                        "done",
+                        f"intent={a.get('intent')} · domain={a.get('domain')} · "
+                        f"complexity={a.get('complexity')} → routed to {routed_to}",
+                    )
                     yield sse({
                         "type": "agent_route",
                         "routed_to": routed_to,
@@ -716,31 +753,48 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                         "metadata": event.get("agent_metadata") or {},
                     })
                     yield sse({"type": "thinking", "text": f"Routed to {routed_to} agent…"})
-                if event.get("type") == "analysis":
+                elif etype == "analysis":
                     analysis = event.get("analysis")
                     yield sse({"type": "analysis", "analysis": analysis, "model": GROQ_MODEL})
-                if event.get("type") == "token":
+                elif etype == "agent_start":
+                    agent = event.get("agent") or routed_to
+                    yield step(agent, "running", f"{agent} agent generating reply…")
+                    yield sse({"type": "thinking", "text": f"{agent} agent is writing…"})
+                elif etype == "agent_done":
+                    agent = event.get("agent") or routed_to
+                    yield step(agent, "done", f"Reply generated · {event.get('reply_chars') or 0} characters")
+                elif etype == "token":
                     reply_parts.append(event.get("content") or "")
-                if event.get("type") == "done":
-                    pass
-                yield sse(event)
-
+                    yield sse(event)
+                elif etype == "error":
+                    yield sse(event)
+                # "done" and unknown events are handled after the loop
+    
             reply = "".join(reply_parts).strip()
             if reply:
                 # Title + followups
                 title = query[:60]
+                yield step("title", "running", "LLM generating chat title…")
                 try:
                     title = suggest_title(query, reply, api_key, GROQ_MODEL)
+                    yield step("title", "done", f"“{title}”")
                 except Exception:
-                    pass
+                    yield step("title", "skip", "Using query excerpt as title")
                 followups: list[str] = []
+                yield step("followups", "running", "LLM generating follow-up questions…")
                 try:
                     followups = suggest_followups(query, reply, api_key, GROQ_MODEL)
+                    yield step("followups", "done", f"{len(followups)} question(s) generated from query + reply")
                 except Exception:
-                    pass
-
+                    yield step("followups", "skip", "Could not generate follow-ups")
+    
                 stored = loaded["history"] + [{"role": "assistant", "content": reply}]
                 writes = save_all(journey_id, user_id, stored, title or query, reply, analysis)
+                yield step(
+                    "memory_write",
+                    "done",
+                    f"{sum(1 for w in writes if w.get('wrote'))} memory store(s) updated",
+                )
                 yield sse({
                     "type": "memory_write",
                     "writes": writes,
