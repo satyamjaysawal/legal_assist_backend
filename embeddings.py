@@ -72,6 +72,45 @@ def _fastembed_embed(texts: list[str]) -> list[list[float]]:
     return [vec.tolist() for vec in _fastembed.embed(texts)]
 
 
+_STOPWORDS = {
+    "a", "an", "the", "is", "am", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "to", "of", "in", "on", "at", "for", "with", "by",
+    "i", "me", "my", "we", "our", "you", "your", "he", "she", "it", "they",
+    "this", "that", "these", "those", "and", "or", "but", "if", "so", "as",
+    "can", "could", "will", "would", "should", "shall", "may", "might", "must",
+    "not", "no", "yes", "from", "into", "about", "there", "here", "than", "then",
+}
+
+# Canonical synonym groups — maps surface forms to one token so that
+# paraphrases ("explain"/"tell", "steps"/"process", "how"/"what") overlap.
+_SYNONYMS: dict[str, str] = {}
+for _canon, _members in {
+    "describe": ["explain", "tell", "describe", "show", "list", "detail"],
+    "process": ["steps", "step", "process", "procedure", "way", "ways", "method"],
+    "how": ["how", "what", "which", "why", "when", "where", "who"],
+    "file": ["file", "filing", "submit", "apply", "application", "lodge"],
+}.items():
+    for _m in _members:
+        _SYNONYMS[_m] = _canon
+
+
+def _tokenize(text: str) -> list[str]:
+    raw = re.findall(r"[a-z0-9]+", (text or "").lower())
+    tokens: list[str] = []
+    for t in raw:
+        # light suffix-stripping so "filing"/"filed"/"files" ≈ "file"
+        t = (
+            t[:-3] if len(t) > 5 and t.endswith("ing") else
+            t[:-2] if len(t) > 4 and t.endswith("ed") else
+            t[:-2] if len(t) > 3 and t.endswith("ly") else
+            t[:-1] if len(t) > 3 and t.endswith("s") else t
+        )
+        t = _SYNONYMS.get(t, t)
+        if t not in _STOPWORDS:
+            tokens.append(t)
+    return tokens
+
+
 def _hash_embed(texts: list[str]) -> list[list[float]]:
     """Deterministic bag-of-words feature-hashing embeddings.
 
@@ -79,25 +118,23 @@ def _hash_embed(texts: list[str]) -> list[list[float]]:
     embeddings are unavailable and FastEmbed cannot write model files
     to disk.  Cosine similarity over these vectors approximates token
     overlap — good enough for semantic cache / semantic memory.
+    Unigrams carry double weight so short paraphrases still score well.
     """
     vectors: list[list[float]] = []
     for text in texts:
         vec = [0.0] * EMBED_DIM
-        raw = re.findall(r"[a-z0-9]+", (text or "").lower())
-        # light suffix-stripping so "filing"/"filed"/"files" ≈ "file"
-        tokens = [
-            t[:-3] if len(t) > 5 and t.endswith("ing") else
-            t[:-2] if len(t) > 4 and t.endswith("ed") else
-            t[:-2] if len(t) > 3 and t.endswith("ly") else
-            t[:-1] if len(t) > 3 and t.endswith("s") else t
-            for t in raw
-        ]
-        grams = tokens + [f"{a}_{b}" for a, b in zip(tokens, tokens[1:])]
-        for gram in grams:
+        tokens = _tokenize(text)
+
+        def bump(gram: str, weight: float) -> None:
             digest = hashlib.md5(gram.encode("utf-8")).digest()
             idx = int.from_bytes(digest[:4], "little") % EMBED_DIM
             sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vec[idx] += sign
+            vec[idx] += sign * weight
+
+        for token in tokens:
+            bump(token, 2.0)
+        for a, b in zip(tokens, tokens[1:]):
+            bump(f"{a}_{b}", 1.0)
         norm = math.sqrt(sum(v * v for v in vec)) or 1.0
         vectors.append([v / norm for v in vec])
     return vectors

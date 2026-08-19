@@ -13,7 +13,7 @@ from memory import get_redis
 logger = logging.getLogger("legal_assist.cache")
 
 PROMPT_CACHE_TTL = int(os.getenv("PROMPT_CACHE_TTL", "21600"))
-SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.65"))
+SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.55"))
 SEMANTIC_INDEX_KEY = "legal_assist:scache:index"
 SEMANTIC_MAX_ENTRIES = int(os.getenv("SEMANTIC_MAX_ENTRIES", "300"))
 _local: dict[str, dict[str, Any]] = {}
