@@ -212,6 +212,9 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
     for entry_id, entry in index.items():
         if entry.get("model") != model:
             continue
+        # Ignore stale/too-generic entries stored before the min-token guard
+        if (entry.get("tokens") or 0) < SEMANTIC_MIN_TOKENS:
+            continue
         dvec = entry.get("vector") or []
         if not dvec:
             continue
