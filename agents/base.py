@@ -110,23 +110,44 @@ def unpack_stream_part(part: Any) -> tuple[str | None, Any]:
     return None, None
 
 
-def invoke_text(llm, messages, config: Optional[dict] = None, retries: int = 2) -> str:
+def invoke_text(llm, messages, config: Optional[dict] = None, retries: int = 3) -> str:
     """Invoke an LLM with retry and robust text extraction.
 
     Retries on exceptions or empty content (Groq occasionally returns
-    empty/reasoning-only payloads).  Raises the last error if all
-    attempts fail.
+    empty/reasoning-only payloads).  On rate-limit (429) errors it
+    automatically switches to a fallback model so the demo keeps
+    working even when the primary model's daily quota is exhausted.
+    Raises the last error if all attempts fail.
     """
     last_error: Exception | None = None
+    current = llm
     for attempt in range(retries + 1):
         try:
-            result = llm.invoke(messages, config=config) if config else llm.invoke(messages)
+            result = current.invoke(messages, config=config) if config else current.invoke(messages)
             text = message_text(result).strip()
             if text:
                 return text
             last_error = RuntimeError("LLM returned empty content")
         except Exception as exc:  # noqa: BLE001 — retry on any provider error
             last_error = exc
+            if _is_provider_rate_limit(exc) and config:
+                cfg = config.get("configurable", {}) or {}
+                api_key = cfg.get("api_key", "")
+                current_model = getattr(current, "model_name", "") or ""
+                for fallback in FALLBACK_MODELS:
+                    if fallback != current_model:
+                        temp = float(getattr(current, "temperature", 0.4) or 0.4)
+                        current = get_llm(api_key, fallback, temperature=temp)
+                        break
         if attempt < retries:
             time.sleep(1.0 * (attempt + 1))
     raise last_error or RuntimeError("LLM returned empty content")
+
+
+# Models tried in order when the primary model is rate-limited (429)
+FALLBACK_MODELS = ["openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound-mini"]
+
+
+def _is_provider_rate_limit(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "429" in text or "rate_limit" in text or "rate limit" in text
