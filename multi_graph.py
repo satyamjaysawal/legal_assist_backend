@@ -6,7 +6,8 @@ Architecture:
                    ├──► draft
                    ├──► document_creator
                    ├──► email
-                   └──► lawyer_finder
+                   ├──► lawyer_finder
+                   └──► db_chat
 
 Each specialist writes its reply into state["reply"].
 The orchestrator's ``decide_route`` is used as a conditional edge.
@@ -25,6 +26,7 @@ from agents.draft import draft_generate
 from agents.document_creator import document_creator_generate
 from agents.email_agent import email_generate
 from agents.lawyer_finder import lawyer_finder_generate
+from agents.db_chat import db_chat_generate
 
 
 def build_multi_graph(api_key: str, model: str):
@@ -40,6 +42,7 @@ def build_multi_graph(api_key: str, model: str):
     graph.add_node("document_creator", document_creator_generate)
     graph.add_node("email", email_generate)
     graph.add_node("lawyer_finder", lawyer_finder_generate)
+    graph.add_node("db_chat", db_chat_generate)
 
     # ── Edges ───────────────────────────────────────────────────
     graph.add_edge(START, "orchestrator")
@@ -55,11 +58,12 @@ def build_multi_graph(api_key: str, model: str):
             "document_creator": "document_creator",
             "email": "email",
             "lawyer_finder": "lawyer_finder",
+            "db_chat": "db_chat",
         },
     )
 
     # All specialist agents → END
-    for agent_name in ("assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder"):
+    for agent_name in ("assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat"):
         graph.add_edge(agent_name, END)
 
     return graph.compile()

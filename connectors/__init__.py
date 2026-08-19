@@ -16,6 +16,7 @@ from connectors.bare_acts import BareActsConnector
 from connectors.court_api import CourtAPIConnector
 from connectors.legal_templates import LegalTemplatesConnector
 from connectors.legal_dictionary import LegalDictionaryConnector
+from connectors.neon_postgres import NeonPostgresConnector
 
 __all__ = [
     "ConnectorStatus",
@@ -26,4 +27,5 @@ __all__ = [
     "CourtAPIConnector",
     "LegalTemplatesConnector",
     "LegalDictionaryConnector",
+    "NeonPostgresConnector",
 ]

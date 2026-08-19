@@ -27,14 +27,14 @@ ORCHESTRATOR_PROMPT = """You are the root orchestrator agent for a legal AI assi
 Read the latest user message and return ONLY valid JSON:
 
 {
-  "intent": "question|draft|review|procedure|compare|document|email|find_lawyer|other",
+  "intent": "question|draft|review|procedure|compare|document|email|find_lawyer|db_query|other",
   "domain": "contract|criminal|civil|family|employment|ip|property|tax|constitutional|general",
   "complexity": "simple|medium|complex",
   "jurisdiction": "country or state if mentioned, else unspecified",
   "on_topic": true,
   "summary": "one short sentence describing the user's need",
   "refined_query": "clearer rewrite of the latest user question",
-  "route_to": "assistant|researcher|draft|document_creator|email|lawyer_finder"
+  "route_to": "assistant|researcher|draft|document_creator|email|lawyer_finder|db_chat"
 }
 
 Routing rules:
@@ -47,6 +47,10 @@ Routing rules:
 - "procedure" (step-by-step legal process) → "assistant"
 - "compare" (compare laws, options) → "researcher"
 - "find_lawyer" (user wants a lawyer / advocate) → "lawyer_finder"
+- "db_query" (ask for listings/statistics from the lawyer directory database:
+  filter/count/rank lawyers by city, experience, fees, rating, reviews,
+  e.g. "show lawyers in Mumbai with 10+ years experience", "how many
+  criminal lawyers do you have", "cheapest family lawyers in Delhi") → "db_chat"
 - Anything else → "assistant"
 
 No markdown, no extra text."""
@@ -61,6 +65,7 @@ INTENT_AGENT_MAP: dict[str, str] = {
     "document": "document_creator",
     "email": "email",
     "find_lawyer": "lawyer_finder",
+    "db_query": "db_chat",
     "other": "assistant",
 }
 
@@ -141,7 +146,7 @@ def decide_route(state: AgentState) -> str:
     """Conditional-edge function used by LangGraph to pick the next node."""
     route = (state.get("routed_to") or "assistant").strip()
     # validate against known agents
-    valid = {"assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder"}
+    valid = {"assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat"}
     return route if route in valid else "assistant"
 
 

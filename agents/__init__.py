@@ -12,6 +12,7 @@ from agents.researcher import researcher_generate
 from agents.draft import draft_generate
 from agents.document_creator import document_creator_generate
 from agents.lawyer_finder import lawyer_finder_generate
+from agents.db_chat import db_chat_generate
 
 __all__ = [
     "AGENT_REGISTRY",
@@ -24,4 +25,5 @@ __all__ = [
     "draft_generate",
     "document_creator_generate",
     "lawyer_finder_generate",
+    "db_chat_generate",
 ]
