@@ -79,12 +79,14 @@ _STOPWORDS = {
     "this", "that", "these", "those", "and", "or", "but", "if", "so", "as",
     "can", "could", "will", "would", "should", "shall", "may", "might", "must",
     "not", "no", "yes", "from", "into", "about", "there", "here", "than", "then",
+    # Interrogatives carry no topical signal and appear in nearly every
+    # question — keeping them makes unrelated questions look similar.
+    "who", "whom", "whose", "what", "whatever", "which", "whichever",
+    "why", "when", "whenever", "where", "wherever", "how", "however",
 }
 
 # Canonical synonym groups — maps surface forms to one token so that
 # paraphrases ("explain"/"tell", "steps"/"process") overlap.
-# NOTE: interrogatives (how/what/who) are deliberately NOT grouped —
-# they appear in nearly every question and cause cross-topic false hits.
 _SYNONYMS: dict[str, str] = {}
 for _canon, _members in {
     "describe": ["explain", "tell", "describe", "show", "list", "detail"],
@@ -101,14 +103,19 @@ def _tokenize(text: str) -> list[str]:
     raw = re.findall(r"[a-z0-9]+", (text or "").lower())
     tokens: list[str] = []
     for t in raw:
-        # light suffix-stripping so "filing"/"filed"/"files" ≈ "file"
-        t = (
-            t[:-3] if len(t) > 5 and t.endswith("ing") else
-            t[:-2] if len(t) > 4 and t.endswith("ed") else
-            t[:-2] if len(t) > 3 and t.endswith("ly") else
-            t[:-1] if len(t) > 3 and t.endswith("s") else t
-        )
-        t = _SYNONYMS.get(t, t)
+        # synonym lookup BEFORE suffix stripping so irregular surface
+        # forms ("apply" → "file") survive; stripped form as fallback
+        if t in _SYNONYMS:
+            t = _SYNONYMS[t]
+        else:
+            # light suffix-stripping so "filing"/"filed"/"files" ≈ "file"
+            t = (
+                t[:-3] if len(t) > 5 and t.endswith("ing") else
+                t[:-2] if len(t) > 4 and t.endswith("ed") else
+                t[:-2] if len(t) > 3 and t.endswith("ly") else
+                t[:-1] if len(t) > 3 and t.endswith("s") else t
+            )
+            t = _SYNONYMS.get(t, t)
         # drop stopwords and single-char noise (e.g. "m" from "I'm")
         if t not in _STOPWORDS and len(t) >= 2:
             tokens.append(t)

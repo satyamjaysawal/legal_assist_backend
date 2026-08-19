@@ -14,6 +14,10 @@ logger = logging.getLogger("legal_assist.cache")
 
 PROMPT_CACHE_TTL = int(os.getenv("PROMPT_CACHE_TTL", "21600"))
 SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.55"))
+# Queries that reduce to fewer content tokens than this are too generic
+# to cache semantically (e.g. "who am I", "help") — they would match
+# unrelated queries and serve wrong cached answers.
+SEMANTIC_MIN_TOKENS = int(os.getenv("SEMANTIC_MIN_TOKENS", "2"))
 SEMANTIC_INDEX_KEY = "legal_assist:scache:index"
 SEMANTIC_MAX_ENTRIES = int(os.getenv("SEMANTIC_MAX_ENTRIES", "300"))
 _local: dict[str, dict[str, Any]] = {}
@@ -193,6 +197,17 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
         report["detail"] = "Query has no comparable content tokens — semantic cache skipped"
         return None, report
 
+    # Symmetric guard with the store: ultra-generic queries must not
+    # match cached entries (they would get unrelated cached answers).
+    try:
+        from embeddings import _tokenize
+
+        if len(_tokenize(query)) < SEMANTIC_MIN_TOKENS:
+            report["detail"] = "Query too generic for semantic matching"
+            return None, report
+    except Exception:
+        pass
+
     best_id, best_score, best_entry = "", 0.0, None
     for entry_id, entry in index.items():
         if entry.get("model") != model:
@@ -200,9 +215,12 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
         dvec = entry.get("vector") or []
         if not dvec:
             continue
-        # containment = cosine * (||cached|| / ||query||) on L2-normalized vectors
+        # Containment scoring: cosine scaled by cached/query norm ratio so a
+        # short paraphrase of a longer cached query still hits. Capped so a
+        # tiny query can never blow a small overlap past the threshold.
         d_norm = entry.get("norm") or 1.0
-        score = min(1.0, _cosine(qvec, dvec) * d_norm / q_norm)
+        ratio = min(1.6, max(0.5, d_norm / q_norm)) if q_norm else 1.0
+        score = min(1.0, _cosine(qvec, dvec) * ratio)
         if score > best_score:
             best_id, best_score, best_entry = entry_id, score, entry
 
@@ -265,6 +283,17 @@ def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, A
         report["detail"] = "Query has no comparable content tokens — semantic store skipped"
         return report
 
+    # Guard: don't pollute the index with ultra-generic queries.
+    try:
+        from embeddings import _tokenize
+
+        n_tokens = len(_tokenize(query))
+    except Exception:
+        n_tokens = SEMANTIC_MIN_TOKENS
+    if n_tokens < SEMANTIC_MIN_TOKENS:
+        report["detail"] = f"Query too generic to cache semantically ({n_tokens} content token(s))"
+        return report
+
     entry_id = prompt_cache_id(query, model, extra) + "s"
     entry = {
         "id": entry_id,
@@ -272,6 +301,7 @@ def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, A
         "model": model,
         "vector": qvec,
         "norm": q_norm,
+        "tokens": n_tokens,
         "cached_at": _now(),
     }
     _sem_local[entry_id] = entry
