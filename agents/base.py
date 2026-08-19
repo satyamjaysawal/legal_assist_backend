@@ -1,5 +1,6 @@
 """Base types, shared state definition, and agent registry."""
 
+import re
 import time
 from typing import Any, Callable, Optional, TypedDict
 
@@ -129,6 +130,9 @@ def invoke_text(llm, messages, config: Optional[dict] = None, retries: int = 3) 
         try:
             result = current.invoke(messages, config=config) if config else current.invoke(messages)
             text = message_text(result).strip()
+            # Some reasoning models leak <think>...</think> traces into
+            # the visible reply — strip them before serving.
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
             if text:
                 return text
             last_error = RuntimeError("LLM returned empty content")

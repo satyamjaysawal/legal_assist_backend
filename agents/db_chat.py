@@ -60,7 +60,8 @@ Write a clear, friendly answer in Markdown:
 - Mention experience, fees, ratings, city etc. only if present in the rows.
 - If zero rows came back, say so honestly and suggest broadening the filters.
 - End with a one-line note that the data is sample/demo directory data.
-- If the user shared their name (see profile), address them by it."""
+- If the user shared their name (see profile), address them by it.
+- Output ONLY the final answer — never include reasoning or thinking traces."""
 
 
 def _get_llm(api_key: str, model: str, tag: str, temperature: float):
@@ -76,14 +77,23 @@ def _generate_sql(question: str, schema: str, api_key: str, model: str, config) 
     llm = _get_llm(api_key, model, "sql", 0.0)
     system = SQL_GEN_SYSTEM.format(schema=schema)
     raw = invoke_text(llm, to_lc_messages([{"role": "user", "content": question}], system), config)
+    # Preferred: JSON {"sql": "..."}
     fenced = re.search(r"\{.*\}", raw, re.DOTALL)
-    text = fenced.group(0) if fenced else raw.strip()
-    try:
-        data = json.loads(text)
-        return str(data.get("sql") or "").strip()
-    except json.JSONDecodeError:
-        logger.warning("db_chat: SQL generator returned non-JSON: %r", raw[:200])
-        return raw.strip()
+    if fenced:
+        try:
+            data = json.loads(fenced.group(0))
+            return str(data.get("sql") or "").strip()
+        except json.JSONDecodeError:
+            pass
+    # Fallbacks: ```sql fence, or a bare SELECT/WITH statement
+    fence = re.search(r"```(?:sql)?\s*(.+?)```", raw, re.DOTALL | re.IGNORECASE)
+    if fence:
+        return fence.group(1).strip()
+    stripped = raw.strip()
+    if re.match(r"^(select|with)\b", stripped, re.IGNORECASE):
+        return stripped
+    logger.warning("db_chat: SQL generator returned unparsable output: %r", raw[:200])
+    return stripped
 
 
 def db_chat_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
