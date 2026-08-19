@@ -142,6 +142,7 @@ def stream_multi_graph(
                         "type": "agent_done",
                         "agent": node_name,
                         "reply_chars": len(reply),
+                        "agent_metadata": node_state.get("agent_metadata") or {},
                     }
 
         if reply:

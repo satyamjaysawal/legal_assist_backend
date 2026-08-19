@@ -1,6 +1,7 @@
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import logging
@@ -793,6 +794,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
             reply_parts: list[str] = []
             analysis = None
             routed_to = "assistant"
+            specialist_meta: dict[str, Any] = {}
     
             yield sse({"type": "thinking", "text": "Root agent classifying intent…"})
             yield step("orchestrator", "running", "Root agent reading query → intent · domain · complexity")
@@ -839,7 +841,17 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     yield sse({"type": "thinking", "text": f"{agent} agent is writing…"})
                 elif etype == "agent_done":
                     agent = event.get("agent") or routed_to
-                    yield step(agent, "done", f"Reply generated · {event.get('reply_chars') or 0} characters")
+                    specialist_meta = event.get("agent_metadata") or {}
+                    detail = f"Reply generated · {event.get('reply_chars') or 0} characters"
+                    db_info = (specialist_meta.get("db_chat") or {})
+                    if db_info.get("sql"):
+                        detail = (
+                            f"SQL executed · {db_info.get('row_count') or 0} row(s) fetched: "
+                            f"{db_info['sql'][:90]}"
+                        )
+                    elif db_info.get("error"):
+                        detail = f"Query failed — {db_info['error'][:80]}"
+                    yield step(agent, "done", detail)
                 elif etype == "token":
                     reply_parts.append(event.get("content") or "")
                     yield sse(event)
@@ -870,11 +882,25 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
 
                 # ── Store exact (+ semantic when enabled) cache entries ──
                 yield step("cache_write", "running", "Storing cache entries…")
-                exact_write = set_prompt_cache(
-                    query,
-                    GROQ_MODEL,
-                    {"reply": reply, "analysis": analysis or DEFAULT_ANALYSIS, "followups": followups, "title": title},
-                )
+                # Error replies (e.g. failed text-to-SQL) must never be cached,
+                # or the failure would replay from cache for the whole TTL.
+                cache_error = bool(((specialist_meta.get(routed_to) or {}).get("cache_error")))
+                if cache_error:
+                    exact_write = {
+                        "name": "prompt_cache",
+                        "label": "Prompt cache",
+                        "wrote": False,
+                        "store": None,
+                        "when": datetime.now(timezone.utc).isoformat(),
+                        "detail": "Skipped — error reply is not cacheable",
+                    }
+                    logger.info("Cache write skipped for %s (agent reported cache_error)", routed_to)
+                else:
+                    exact_write = set_prompt_cache(
+                        query,
+                        GROQ_MODEL,
+                        {"reply": reply, "analysis": analysis or DEFAULT_ANALYSIS, "followups": followups, "title": title},
+                    )
                 if SEMANTIC_CACHE_ENABLED:
                     sem_write = semantic_cache_store(query, GROQ_MODEL)
                 else:

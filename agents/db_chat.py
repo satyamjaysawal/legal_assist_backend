@@ -117,7 +117,7 @@ def db_chat_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any
                 "Please try again in a moment."
             ),
             "active_agent": "db_chat",
-            "agent_metadata": {"db_chat": {"error": "schema unavailable"}},
+            "agent_metadata": {"db_chat": {"error": "schema unavailable", "cache_error": True}},
         }
 
     # Step 1 — text-to-SQL
@@ -132,7 +132,9 @@ def db_chat_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any
                 "Show top-rated criminal lawyers in Delhi with 10+ years experience*."
             ),
             "active_agent": "db_chat",
-            "agent_metadata": {"db_chat": {"sql": raw_sql[:500], "error": err}},
+            # cache_error: failed attempts must never be cached, otherwise the
+            # exact-match cache replays the failure for 6 hours.
+            "agent_metadata": {"db_chat": {"sql": raw_sql[:500], "error": err, "cache_error": True}},
         }
     logger.info("db_chat executing SQL: %s", clean_sql)
 
@@ -144,7 +146,7 @@ def db_chat_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any
         return {
             "reply": "The database query failed — please rephrase or try again shortly.",
             "active_agent": "db_chat",
-            "agent_metadata": {"db_chat": {"sql": clean_sql, "error": str(exc)[:300]}},
+            "agent_metadata": {"db_chat": {"sql": clean_sql, "error": str(exc)[:300], "cache_error": True}},
         }
 
     rows = result["rows"]
