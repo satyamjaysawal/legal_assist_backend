@@ -1,0 +1,265 @@
+# Legal AI Assistant — Complete Project Documentation
+
+Everything this project does, how it's built, and what's implemented — features, agents, memory, caching, RAG, database, real-time chat, and deployment.
+
+## Quick links
+
+| Item | URL |
+| --- | --- |
+| **Live app (frontend)** | https://legal-assist-compact.vercel.app |
+| **Backend API** | https://legal-assist-api.vercel.app |
+| **API health** | https://legal-assist-api.vercel.app/health |
+| **Swagger docs** | https://legal-assist-api.vercel.app/docs |
+| **Backend repo** | https://github.com/satyamjaysawal/legal_assist_backend |
+| **Frontend repo** | https://github.com/satyamjaysawal/legal_assist_frontend |
+
+---
+
+## 1. What is this project?
+
+A **legal AI assistant for India** — users ask legal questions in plain language and get answers, drafts, documents, research, and lawyer connections. Under the hood it's a **multi-agent system**: a root orchestrator reads the intent of every query and routes it to the right specialist agent, while a 7-layer memory system, two-tier caching, and document RAG make every reply personal, fast, and grounded.
+
+The entire pipeline is **streamed live to the UI** — users can watch memory loads, cache hits, routing decisions, executed SQL, and memory writes as they happen.
+
+---
+
+## 2. Architecture overview
+
+```
+User (React UI)
+   │  POST /chat/stream/v2  (SSE)
+   ▼
+FastAPI (main.py)
+   ├─ Auth (JWT) → Journey (chat thread)
+   ├─ Memory load (7 layers) → profile + facts injected
+   ├─ Prompt cache check (exact → semantic) → personal-query bypass
+   ├─ RAG retrieval (Qdrant) over uploaded documents
+   ▼
+LangGraph multi-agent graph (multi_graph.py)
+   Orchestrator (root agent: intent · domain · complexity)
+   ├─ assistant        — general legal Q&A
+   ├─ researcher       — deep research / review / compare
+   ├─ draft            — legal drafting
+   ├─ document_creator — structured documents
+   ├─ email            — email composition
+   ├─ lawyer_finder    — lawyer directory + live chat
+   └─ db_chat          — text-to-SQL on Neon Postgres
+   ▼
+Reply streamed token-by-token
+   ├─ Follow-up generator
+   ├─ Cache save (exact always · semantic if enabled · errors never)
+   └─ Memory save (all 7 layers + profile extraction)
+```
+
+**Infra:** MongoDB (users, journeys, facts, GridFS files) · Redis (short-term memory + exact cache) · Qdrant Cloud (semantic memory + RAG vectors) · Neon Postgres (lawyer directory) · Groq (LLMs + embeddings).
+
+---
+
+## 3. Implemented agents
+
+All agents are registered in a central registry and discovered by the orchestrator. Source: `agents/`.
+
+### 3.1 Orchestrator (`orchestrator.py`) — Root agent
+- Classifies every query: **intent**, **domain**, **complexity**, **jurisdiction**, on-topic check.
+- Produces a refined query and picks the specialist (`route_to`).
+- Intents: `question`, `procedure`, `review`, `compare`, `draft`, `document`, `email`, `find_lawyer`, `db_query`, `other`.
+
+### 3.2 Assistant (`assistant.py`)
+- Handles `question`, `procedure`, `other`.
+- General legal Q&A, step-by-step procedures, rights and remedies — personalized with user profile and memory.
+
+### 3.3 Researcher (`researcher.py`)
+- Handles `review`, `compare`.
+- Deep legal research: document review, statute/case-law comparisons, structured findings.
+
+### 3.4 Draft (`draft.py`)
+- Handles `draft`.
+- Legal notices, agreements, letters, petitions. Replies support **PDF / DOCX / TXT export** and the HITL field-filling wizard.
+
+### 3.5 Document Creator (`document_creator.py`)
+- Handles `document`.
+- Structured documents: RTI applications, complaints, agreements, formal notices.
+
+### 3.6 Email (`email_agent.py`)
+- Handles `email`.
+- Professional legal emails (client communication, notices, follow-ups); can be sent via SMTP or exported.
+
+### 3.7 Lawyer Finder (`lawyer_finder.py`)
+- Handles `find_lawyer`.
+- Pulls the **live lawyer directory from Neon Postgres** (14 seeded profiles with experience, fees, ratings, reviews) with a demo-listing fallback.
+- Presents lawyers in a Markdown table and points users to the **💬 Live Chat with Lawyer** button.
+
+### 3.8 DB Chat (`db_chat.py`) — Text-to-SQL
+- Handles `db_query` (e.g. *"cheapest family lawyer in Delhi"*, *"average fees in Mumbai"*).
+- Pipeline: schema introspection → LLM generates SQL (JSON / fence / bare-SELECT parsing) → **safety validation** → read-only execution → LLM formats rows into a Markdown answer.
+- Safety layers: SELECT/WITH only, forbidden-keyword rejection, comment stripping, single statement, `LIMIT ≤ 25`, `READ ONLY` transaction, 10s statement timeout.
+- The **executed SQL is sent to the UI** as a dedicated `sql` SSE event and rendered in a code card.
+- Error replies are flagged `cache_error` so failures are **never cached**.
+
+---
+
+## 4. Memory system (7 layers + profile)
+
+Source: `memory.py`. Every turn loads all layers into the prompt and writes back after the reply.
+
+| Layer | Store | Purpose |
+| --- | --- | --- |
+| In-memory | Process RAM | Hot conversation buffer |
+| Short-term | Redis | Recent turns per session |
+| User thread | MongoDB | Full conversation history per journey |
+| Long-term | MongoDB | Extracted durable facts |
+| Semantic | Qdrant | Vector-recall of past interactions |
+| Episodic | MongoDB | Summaries of past conversations (episodes) |
+| Procedural | MongoDB | User preferences (language, tone, format) |
+
+**User profile extraction:** names, emails, phones and facts are mined from the user's **actual message** (not the generated title) and injected into every agent prompt — so *"who am I?"* returns *"Hi Rahul!"*.
+
+**Context compression:** old messages are summarized automatically to fit model context (`Compressed N old messages into summary, kept M recent`).
+
+---
+
+## 5. Caching system
+
+Source: `cache.py`.
+
+| Tier | Key | Store | TTL | Status |
+| --- | --- | --- | --- | --- |
+| **Exact-match** | SHA-256 of normalized prompt | Redis + in-memory | 6 h | Always on |
+| **Semantic** | Embedding cosine similarity | Qdrant + Redis | configurable | **Off by default** — `SEMANTIC_CACHE_ENABLED=true` to enable |
+
+Rules implemented:
+- **Personal-query bypass** — queries like *"who am I?"*, *"what's my name?"* skip both lookup and store so memory (not a stale cache) answers.
+- **Kill-switch** — when semantic cache is disabled the pipeline shows an honest `skip` step: `Semantic cache disabled (SEMANTIC_CACHE_ENABLED=false)`.
+- **Error replies are never cached** (db_chat failures flagged `cache_error`).
+- UI shows read/write status of both tiers in the pipeline panel.
+
+---
+
+## 6. RAG — document upload & retrieval
+
+Endpoint `POST /documents/upload` (max 5 MB): PDF · DOCX · TXT · MD · CSV · images.
+
+Pipeline (fully streamed to the UI): receive → validate → parse (image OCR via vision model) → chunk → MongoDB GridFS (original) → embed chunks (`nomic-embed-text-v1.5`, FastEmbed fallback for serverless) → index in Qdrant.
+
+At query time the top hits are retrieved and injected into the agent prompt; the UI shows the retrieval report and file hits.
+
+---
+
+## 7. Lawyer directory + real-time chat
+
+### 7.1 Neon Postgres directory
+- Tables: `lawyers` (14 seeded profiles: specialisation, city, experience, bar ID, fees, rating, reviews, languages, profile) and `lawyer_reviews` (29 seeded reviews).
+- Seed script: `python seed_neon.py` (`--force` to truncate and reseed).
+- Served to the UI via `GET /lawyers`.
+
+### 7.2 Lawyer Connect (WebSocket)
+Source: `websocket/lawyer_connect.py` + `/lawyer/rooms` REST endpoints.
+
+Flow: user clicks **💬 Lawyer Chat** (header) or **💬 Live Chat with Lawyer** (below any lawyer-finder reply) → directory panel → pick a lawyer → room created (`POST /lawyer/rooms`) → WebSocket `/ws/lawyer/user/{room_id}` connects.
+
+**Demo mode:** until a real lawyer client joins, the server simulates replies in the lawyer's voice — a personalized greeting first, then rotating professional responses (each tagged *simulated demo reply*).
+
+> Vercel serverless does not hold WebSocket connections — live chat works on WebSocket-capable hosts (e.g. local `uvicorn`). The UI degrades gracefully with a clear message.
+
+---
+
+## 8. Frontend features
+
+React + Vite + **Tailwind CSS only** (`src/App.jsx`), deployed at https://legal-assist-compact.vercel.app.
+
+- **Agent Pipeline panel** — live step-by-step visualization: memory reads/writes, exact & semantic cache, RAG, orchestrator routing, specialist work, follow-ups, cache/memory saves
+- **Intent classification chips** — intent · domain · complexity · route
+- **🗄 Executed SQL card** — full SQL, rows fetched, tables, columns for db_chat answers
+- **💬 Lawyer Chat panel** — directory, room creation, WebSocket chat, status pills, end session
+- **HITL Draft-Fill wizard** — guided field-by-field personalization before download/email
+- **Download & Send Email** actions for draft/document/email replies (PDF · DOCX · TXT)
+- Markdown replies with tables, journey sidebar (rename/delete), auto titles, follow-up chips
+- Memory viewer page (profile, stores, episodes, preferences, facts, files)
+- Dark/light themes · guest mode (3 messages) · file uploads with progress pipeline
+
+---
+
+## 9. Models
+
+| Purpose | Model |
+| --- | --- |
+| Chat / reasoning | `openai/gpt-oss-120b` |
+| Fallback chain (429) | `openai/gpt-oss-20b` → `qwen/qwen3.6-27b` → `groq/compound-mini` |
+| Embeddings | `nomic-embed-text-v1.5` (Groq) · FastEmbed local fallback |
+| Vision / OCR | `qwen/qwen3.6-27b` |
+
+All served via Groq with retry-safe invokes and automatic model fallback.
+
+---
+
+## 10. SSE event protocol (`/chat/stream/v2`)
+
+| Event | Payload | Shown as |
+| --- | --- | --- |
+| `thinking` | current activity text | status line |
+| `flow` | pipeline steps array | Agent Pipeline timeline |
+| `memory` | layers + facts | Memory reads chips |
+| `retrieval` | report + hits | RAG pill + files |
+| `cache` / `cache_write` | tier reports | cache pills + detail |
+| `agent_route` | routed agent + analysis | route chip |
+| `analysis` | intent/domain/complexity | classification chips |
+| `sql` | sql · row_count · columns · tables | Executed SQL card |
+| `token` | streamed text | answer body |
+| `followups` | suggested questions | follow-up chips |
+| `memory_write` | write reports + title | Memory writes chips |
+| `done` / `error` | model / detail | terminal state |
+
+---
+
+## 11. API reference (summary)
+
+| Group | Endpoints |
+| --- | --- |
+| System | `GET /` · `GET /health` |
+| Auth | `POST /auth/register` · `POST /auth/login` · `GET/PATCH /auth/me` |
+| Journeys | `GET/POST /journeys` · `PATCH/DELETE /journeys/{id}` · `DELETE /journeys` |
+| Chat | `POST /chat` · `/chat/stream` · `/chat/stream/v2` · `/chat/guest` |
+| Memory | `GET /memory` · `GET/PUT/DELETE /memory/profile` · `GET /memory/episodes` · `GET /memory/preferences` |
+| Documents | `POST /documents/upload` · `GET /documents` · `GET /documents/{id}/file` · `DELETE /documents/{id}` |
+| Connectors | `GET /connectors` · `GET /connectors/{name}` |
+| Lawyers | `GET /lawyers` |
+| Lawyer chat | `POST/GET /lawyer/rooms` · `GET/DELETE /lawyer/rooms/{id}` · `GET /lawyer/my-rooms` · `WS /ws/lawyer/user/{room_id}` · `WS /ws/lawyer/lawyer/{room_id}` |
+| Output | `POST /export/download` · `POST /email/send` |
+| Admin | `GET /admin/system` · `/admin/agents` · `/admin/connectors` |
+
+Full interactive docs: https://legal-assist-api.vercel.app/docs
+
+---
+
+## 12. Deployment
+
+Both apps are deployed on **Vercel** under [satyam-jaysawals-projects](https://vercel.com/satyam-jaysawals-projects).
+
+| App | Vercel project | Production alias |
+| --- | --- | --- |
+| Backend | `legal-assist-api` | https://legal-assist-api.vercel.app |
+| Frontend | `legal-assist` | https://legal-assist-compact.vercel.app |
+
+Workflow (run from each app directory):
+
+```powershell
+git add -A; git commit -m "<message>"; git push
+vercel --prod --yes
+# backend only — re-alias after every deploy:
+vercel alias set <deployment-url> legal-assist-api.vercel.app
+```
+
+The frontend reads `VITE_API_URL` (set in Vercel project settings) at build time.
+
+---
+
+## 13. Try it
+
+Log in at https://legal-assist-compact.vercel.app and try:
+
+- *"What are my rights as a tenant in India?"* — assistant + memory + pipeline view
+- *"Show lawyers in Mumbai with 10+ years experience"* — lawyer_finder + 💬 Live Chat button
+- *"List the top 5 highest rated lawyers from the database"* — db_chat + 🗄 Executed SQL card
+- *"Average fees of criminal lawyers in Delhi"* — text-to-SQL aggregation
+- Upload a PDF and ask about it — RAG pipeline
+- *"Draft a rent notice to my landlord"* — draft agent + HITL wizard + PDF/DOCX export
