@@ -12,33 +12,54 @@ is functional, but the lawyer-side UI and persistence are stubs.
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any
 from uuid import uuid4
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+logger = logging.getLogger("legal_assist.lawyer_connect")
+
 # ── In-memory room store (replace with Redis/MongoDB for production) ────
 _rooms: dict[str, dict[str, Any]] = {}
+
+# Demo replies used when no real lawyer client is connected to the room.
+_SIMULATED_REPLIES = [
+    "Thanks for the details. Could you share when this matter started and whether any notice or court date is involved?",
+    "Understood. From what you've described, the first step would be to review any documents you have (notices, agreements, receipts). Do you have them handy?",
+    "That's helpful context. I'd suggest we schedule a proper consultation so I can review the papers in detail — meanwhile, avoid signing anything new.",
+    "Noted. If you can upload the relevant documents in your chat, I can give you a clearer view on next steps and likely timelines.",
+    "Alright, I have a fair picture now. I'll note this down and we can continue — feel free to ask anything specific you want clarified.",
+]
 
 
 def _now() -> float:
     return time.time()
 
 
-def create_room(user_id: str, lawyer_id: str, journey_id: str = "") -> dict[str, Any]:
+def create_room(
+    user_id: str,
+    lawyer_id: str,
+    journey_id: str = "",
+    lawyer_name: str = "",
+    lawyer_meta: str = "",
+) -> dict[str, Any]:
     """Create a new chat room between a user and a lawyer."""
     room_id = str(uuid4())
     room = {
         "room_id": room_id,
         "user_id": user_id,
         "lawyer_id": lawyer_id,
+        "lawyer_name": lawyer_name,
+        "lawyer_meta": lawyer_meta,
         "journey_id": journey_id,
         "status": "waiting",  # waiting → active → closed
         "messages": [],
         "created_at": _now(),
         "user_ws": None,
         "lawyer_ws": None,
+        "simulated_count": 0,
     }
     _rooms[room_id] = room
     return {"room_id": room_id, "status": "waiting"}
@@ -73,6 +94,46 @@ def close_room(room_id: str) -> dict[str, Any]:
     return {"room_id": room_id, "status": "closed"}
 
 
+def _simulated_reply_text(room: dict[str, Any], user_text: str) -> str:
+    """Compose the next demo reply in the lawyer's voice."""
+    name = room.get("lawyer_name") or "the lawyer"
+    meta = room.get("lawyer_meta") or ""
+    count = room.get("simulated_count", 0)
+    if count == 0:
+        intro = f"Hello! This is {name}"
+        if meta:
+            intro += f" ({meta})"
+        return (
+            f"{intro}. Thanks for reaching out — I've read your message: "
+            f"\"{user_text[:120]}\". Please tell me a little more about your "
+            "matter so I can guide you better."
+        )
+    return _SIMULATED_REPLIES[(count - 1) % len(_SIMULATED_REPLIES)]
+
+
+async def _simulate_lawyer_reply(room: dict[str, Any], user_text: str) -> None:
+    """Demo mode: reply as the lawyer when no real lawyer client is connected."""
+    try:
+        await asyncio.sleep(2.0)
+        if room.get("lawyer_ws") or room.get("status") == "closed":
+            return
+        text = _simulated_reply_text(room, user_text)
+        room["simulated_count"] = room.get("simulated_count", 0) + 1
+        message = {"sender": "lawyer", "text": text, "timestamp": _now(), "simulated": True}
+        room["messages"].append(message)
+        user_ws = room.get("user_ws")
+        if user_ws is not None:
+            await user_ws.send_json({
+                "type": "message",
+                "sender": "lawyer",
+                "text": text,
+                "timestamp": message["timestamp"],
+                "simulated": True,
+            })
+    except Exception as exc:
+        logger.warning("Simulated lawyer reply failed for room %s: %s", room.get("room_id"), exc)
+
+
 async def handle_user_websocket(websocket: WebSocket, room_id: str, user_id: str) -> None:
     """Handle WebSocket connection from the user side."""
     await websocket.accept()
@@ -93,7 +154,11 @@ async def handle_user_websocket(websocket: WebSocket, room_id: str, user_id: str
         "type": "connected",
         "room_id": room_id,
         "lawyer_id": room["lawyer_id"],
-        "message": "Connected to lawyer chat. Messages will be relayed in real-time.",
+        "lawyer_name": room.get("lawyer_name") or room["lawyer_id"],
+        "message": (
+            "Connected to lawyer chat. Demo mode: until a real lawyer joins, "
+            "replies are simulated in the lawyer's voice."
+        ),
     })
 
     try:
@@ -109,7 +174,7 @@ async def handle_user_websocket(websocket: WebSocket, room_id: str, user_id: str
                 }
                 room["messages"].append(message)
 
-                # Relay to lawyer if connected
+                # Relay to lawyer if connected, otherwise simulate a demo reply
                 if room.get("lawyer_ws"):
                     try:
                         await room["lawyer_ws"].send_json({
@@ -120,6 +185,8 @@ async def handle_user_websocket(websocket: WebSocket, room_id: str, user_id: str
                         })
                     except Exception:
                         pass
+                else:
+                    asyncio.create_task(_simulate_lawyer_reply(room, message["text"]))
 
                 await websocket.send_json({
                     "type": "sent",

@@ -847,8 +847,16 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     if db_info.get("sql"):
                         detail = (
                             f"SQL executed · {db_info.get('row_count') or 0} row(s) fetched: "
-                            f"{db_info['sql'][:90]}"
+                            f"{db_info['sql'][:120]}"
                         )
+                        # Surface the executed SQL to the user in the UI
+                        yield sse({
+                            "type": "sql",
+                            "sql": db_info["sql"],
+                            "row_count": db_info.get("row_count") or 0,
+                            "columns": db_info.get("columns") or [],
+                            "tables": db_info.get("tables") or [],
+                        })
                     elif db_info.get("error"):
                         detail = f"Query failed — {db_info['error'][:80]}"
                     yield step(agent, "done", detail)
@@ -1102,12 +1110,28 @@ def connector_detail(connector_name: str, query: str = ""):
 class LawyerRoomCreate(BaseModel):
     lawyer_id: str
     journey_id: str = ""
+    lawyer_name: str = ""
+    lawyer_meta: str = ""
+
+
+@app.get("/lawyers")
+def lawyers_directory(user: dict = Depends(current_user)):
+    """Live lawyer directory from Neon Postgres (backs the Lawyer Chat panel)."""
+    from connectors.neon_postgres import list_lawyers  # noqa: PLC0415
+    lawyers = list_lawyers()
+    return {"lawyers": lawyers, "count": len(lawyers)}
 
 
 @app.post("/lawyer/rooms")
 def lawyer_room_create(payload: LawyerRoomCreate, user: dict = Depends(current_user)):
     """Create a real-time chat room between user and lawyer."""
-    room = create_room(user["user_id"], payload.lawyer_id, payload.journey_id)
+    room = create_room(
+        user["user_id"],
+        payload.lawyer_id,
+        payload.journey_id,
+        lawyer_name=payload.lawyer_name,
+        lawyer_meta=payload.lawyer_meta,
+    )
     return room
 
 

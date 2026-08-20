@@ -29,11 +29,37 @@ You help users find suitable lawyers based on their legal needs.
 Guidelines:
 - Understand the user's legal domain and jurisdiction.
 - Suggest the type of lawyer they need (criminal, civil, family, etc.).
-- Present the available lawyer listings (even if dummy data).
-- Explain how to connect via the real-time chat feature (WebSocket).
-- Mention that the lawyer directory is being populated.
+- Present the available lawyer listings from the directory data provided.
+- To start a live conversation, tell the user to click the
+  "💬 Live Chat with Lawyer" button shown below your reply — it opens a
+  real-time WebSocket chat room with the selected lawyer.
+- Keep scheduling/booking answers simple: the live chat button is the
+  entry point; the lawyer can arrange a time inside the chat.
 - If no specific lawyers are available, guide the user on what kind
   of lawyer to look for and suggest bar association directories."""
+
+
+def _get_directory_lawyers() -> list[dict[str, Any]]:
+    """Fetch the live lawyer directory from Neon Postgres."""
+    try:
+        from connectors.neon_postgres import list_lawyers  # noqa: PLC0415
+        rows = list_lawyers()
+        return [
+            {
+                "id": row.get("id"),
+                "name": row.get("name"),
+                "specialisation": row.get("specialisation"),
+                "jurisdiction": row.get("city") or row.get("state") or "",
+                "experience": f"{row.get('experience_years') or 0} years",
+                "rating": f"{row.get('rating') or 0}/5",
+                "bar_id": row.get("bar_council_id") or "",
+                "fees_per_hearing": row.get("fees_per_hearing"),
+                "available_for_chat": bool(row.get("available_for_chat")),
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
 
 
 def _get_dummy_lawyers(domain: str, jurisdiction: str) -> list[dict[str, str]]:
@@ -89,18 +115,22 @@ def lawyer_finder_generate(state: AgentState, config: RunnableConfig) -> dict[st
     domain = analysis.get("domain", "general")
     jurisdiction = analysis.get("jurisdiction", "unspecified")
 
-    # Get dummy lawyer listings
-    lawyers = _get_dummy_lawyers(domain, jurisdiction)
+    # Prefer the live Neon directory; fall back to demo listings
+    lawyers = _get_directory_lawyers()
+    directory_live = bool(lawyers)
+    if not lawyers:
+        lawyers = _get_dummy_lawyers(domain, jurisdiction)
 
     system = LAWYER_FINDER_SYSTEM
     system += (
-        f"\n\nAvailable lawyers (demo data):\n"
+        f"\n\nAvailable lawyers ({'live directory' if directory_live else 'demo data'}):\n"
         + json.dumps(lawyers, indent=2, ensure_ascii=False)
     )
     system += (
-        "\n\nPresent these lawyers to the user. Mention that they can "
-        "connect via real-time chat (Lawyer Connect feature) with lawyers "
-        "who have 'available_for_chat: true'."
+        "\n\nPresent these lawyers to the user in a clean Markdown table. "
+        "End your reply by telling the user to click the '💬 Live Chat with "
+        "Lawyer' button below this answer to open a real-time chat room "
+        "with any lawyer who has 'available_for_chat: true'."
     )
 
     # Inject user profile
@@ -139,6 +169,7 @@ def lawyer_finder_generate(state: AgentState, config: RunnableConfig) -> dict[st
                 "domain": domain,
                 "jurisdiction": jurisdiction,
                 "lawyers": lawyers,
+                "directory_live": directory_live,
                 "websocket_available": True,
             }
         },

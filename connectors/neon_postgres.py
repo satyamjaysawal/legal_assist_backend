@@ -24,6 +24,11 @@ PG_URL = os.getenv("NEON_POSTGRE_DB", "")
 MAX_ROWS = int(os.getenv("PG_MAX_ROWS", "25"))
 QUERY_TIMEOUT_MS = int(os.getenv("PG_QUERY_TIMEOUT_MS", "10000"))
 
+
+def _pg_url() -> str:
+    """Read the connection string lazily so load_dotenv() ordering is safe."""
+    return PG_URL or os.getenv("NEON_POSTGRE_DB", "")
+
 _schema_cache: dict[str, Any] = {}
 
 
@@ -45,11 +50,12 @@ def get_pg_conn(read_only: bool = True):
     transaction plus a statement timeout; seeding passes read_only=False.
     """
     psycopg2 = _import_psycopg2()
-    if psycopg2 is None or not PG_URL:
+    pg_url = _pg_url()
+    if psycopg2 is None or not pg_url:
         raise RuntimeError("Neon Postgres not configured (NEON_POSTGRE_DB missing or psycopg2 not installed)")
     # Neon's pooler rejects startup `options`, so the timeout is applied
     # with SET right after connecting instead.
-    conn = psycopg2.connect(PG_URL, connect_timeout=10)
+    conn = psycopg2.connect(pg_url, connect_timeout=10)
     try:
         with conn.cursor() as cur:
             cur.execute(f"SET statement_timeout = {QUERY_TIMEOUT_MS}")
@@ -107,9 +113,34 @@ def schema_ddl_text() -> str:
     return "\n".join(lines)
 
 
+def list_lawyers(available_only: bool = False) -> list[dict[str, Any]]:
+    """Return the lawyer directory rows (used by /lawyers and lawyer_finder)."""
+    sql = (
+        "SELECT id, name, specialisation, city, state, experience_years, "
+        "bar_council_id, fees_per_hearing, rating, reviews_count, "
+        "available_for_chat, languages, profile "
+        "FROM lawyers"
+    )
+    if available_only:
+        sql += " WHERE available_for_chat = TRUE"
+    sql += " ORDER BY rating DESC NULLS LAST, experience_years DESC"
+    try:
+        result = run_select(sql, limit=MAX_ROWS)
+    except Exception as exc:
+        logger.warning("Lawyer directory query failed: %s", exc)
+        return []
+    for row in result["rows"]:
+        # JSON-friendly values for the frontend
+        if row.get("fees_per_hearing") is not None:
+            row["fees_per_hearing"] = float(row["fees_per_hearing"])
+        if row.get("rating") is not None:
+            row["rating"] = float(row["rating"])
+    return result["rows"]
+
+
 def pg_status() -> dict[str, Any]:
     """Cheap health probe — SELECT 1 + table count."""
-    if not PG_URL:
+    if not _pg_url():
         return {"name": "neon_postgres", "available": False, "reason": "NEON_POSTGRE_DB not set"}
     if _import_psycopg2() is None:
         return {"name": "neon_postgres", "available": False, "reason": "psycopg2 not installed"}
