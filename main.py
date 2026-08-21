@@ -970,13 +970,19 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     logger.warning("Title generation failed — using query excerpt")
                     yield step("title", "skip", "Using query excerpt as title")
                 followups: list[str] = []
-                yield step("followups", "running", "LLM generating follow-up questions…")
-                try:
-                    followups = suggest_followups(query, reply, api_key, GROQ_MODEL)
-                    yield step("followups", "done", f"{len(followups)} question(s) generated from query + reply")
-                except Exception:
-                    logger.warning("Follow-up generation failed")
-                    yield step("followups", "skip", "Could not generate follow-ups")
+                if hitl_paused:
+                    # The chat is NOT complete — it waits for the human's
+                    # decision. Follow-ups would jump ahead of the approval
+                    # card, so they are generated only after resume finishes.
+                    yield step("followups", "skip", "Paused for approval — follow-ups appear after the decision")
+                else:
+                    yield step("followups", "running", "LLM generating follow-up questions…")
+                    try:
+                        followups = suggest_followups(query, reply, api_key, GROQ_MODEL)
+                        yield step("followups", "done", f"{len(followups)} question(s) generated from query + reply")
+                    except Exception:
+                        logger.warning("Follow-up generation failed")
+                        yield step("followups", "skip", "Could not generate follow-ups")
 
                 # ── Store exact (+ semantic when enabled) cache entries ──
                 yield step("cache_write", "running", "Storing cache entries…")
@@ -1080,6 +1086,7 @@ def chat_hitl_resume(req: HitlResumeRequest, user: dict = Depends(current_user))
 
     def generate():
         reply_parts: list[str] = []
+        re_paused = False
         try:
             yield sse({"type": "thinking", "text": f"Resuming workflow with your decision ({decision})…"})
             for event in resume_hitl(checkpoint, decision, comment, config):
@@ -1115,7 +1122,12 @@ def chat_hitl_resume(req: HitlResumeRequest, user: dict = Depends(current_user))
                 elif etype == "token":
                     reply_parts.append(event.get("content") or "")
                     yield sse(event)
-                elif etype in {"hitl", "error", "done"}:
+                elif etype == "hitl":
+                    # regenerate re-pauses at a fresh checkpoint — chat is
+                    # incomplete again, so no follow-ups afterwards.
+                    re_paused = True
+                    yield sse(event)
+                elif etype in {"error", "done"}:
                     yield sse(event)
 
             reply = "".join(reply_parts).strip()
@@ -1130,6 +1142,17 @@ def chat_hitl_resume(req: HitlResumeRequest, user: dict = Depends(current_user))
                     save_all(journey_id, user_id, stored, journey.get("title") or "Workflow", reply, None)
                 except Exception:
                     logger.warning("HITL resume: journey persistence failed")
+            # The workflow is genuinely complete now — this is the right
+            # moment for follow-up questions (never while paused).
+            if reply and not re_paused:
+                try:
+                    followups = suggest_followups(
+                        checkpoint.get("query") or "", reply, api_key, GROQ_MODEL
+                    )
+                    if followups:
+                        yield sse({"type": "followups", "questions": followups})
+                except Exception:
+                    logger.warning("HITL resume: follow-up generation failed")
         except Exception as exc:
             logger.exception("HITL resume error")
             yield sse({"type": "error", "detail": f"HITL resume error: {exc}"})
