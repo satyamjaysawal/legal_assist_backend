@@ -50,6 +50,12 @@ def _patch_pipeline(monkeypatch, events):
     monkeypatch.setattr(main, "stream_multi_graph", lambda *a, **k: iter(events))
     monkeypatch.setattr(main, "suggest_title", lambda *a, **k: "title")
     monkeypatch.setattr(main, "save_all", lambda *a, **k: [])
+    # Hermetic cache: a live local Redis would otherwise replay entries
+    # written by earlier runs (TTL 6h) and skip suggest_followups.
+    monkeypatch.setattr(main, "get_prompt_cache", lambda *a, **k: (None, {"status": "miss", "detail": "test"}))
+    monkeypatch.setattr(main, "set_prompt_cache", lambda *a, **k: {"wrote": False, "store": None})
+    monkeypatch.setattr(main, "semantic_cache_lookup", lambda *a, **k: (None, {"status": "miss", "detail": "test"}))
+    monkeypatch.setattr(main, "semantic_cache_store", lambda *a, **k: {"wrote": False, "store": None})
 
     def spy_followups(*a, **k):
         calls["followups"] += 1

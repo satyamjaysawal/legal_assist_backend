@@ -36,7 +36,14 @@ Guidelines:
 - Use uploaded document context when provided.
 - Use long-term memory facts when relevant.
 - Keep answers concise but complete.
-- Suggest consulting a lawyer for complex or high-stakes matters."""
+- Suggest consulting a lawyer for complex or high-stakes matters.
+
+Presentation (the UI renders GitHub-flavoured Markdown):
+- Structure longer answers with short ### headings and bullet lists.
+- Bold key terms, deadlines, and section numbers.
+- When comparing items side by side, use a Markdown table with at most
+  4 columns and short cells (never put long sentences inside table cells).
+- Prefer scannable sections over one long paragraph."""
 
 
 def assistant_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
