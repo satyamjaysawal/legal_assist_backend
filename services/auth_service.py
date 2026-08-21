@@ -106,6 +106,30 @@ def login_user(email: str, password: str) -> dict[str, Any]:
     return public_user(doc)
 
 
+def create_anonymous_user() -> dict[str, Any]:
+    """No-login full-access account (role=user).
+
+    The user skips registration entirely but gets the same capabilities as a
+    signed-up user: journeys, memory, uploads, streaming chat, HITL resume.
+    The password is a random unusable hash — the account is only reachable
+    through the issued token.
+    """
+    user_id = str(uuid4())
+    doc = {
+        "user_id": user_id,
+        "email": f"anon-{user_id[:8]}@anonymous.local",
+        "name": "Anonymous user",
+        "role": ROLE_USER,
+        "password_hash": hash_password(uuid4().hex),
+        "anonymous": True,
+        "created_at": _now(),
+        "updated_at": _now(),
+    }
+    users_col().insert_one(doc)
+    logger.info("Anonymous full-access user created: %s", doc["email"])
+    return public_user(doc)
+
+
 def find_user(user_id: str) -> dict[str, Any] | None:
     col = users_col()
     doc = col.find_one({"user_id": user_id})

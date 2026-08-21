@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from services.auth_service import (
     ALL_ROLES, ROLE_GUEST, ROLE_USER, ROLE_LAWYER, ROLE_ADMIN,
-    current_user, login_user, make_token, register_user, update_user,
+    current_user, create_anonymous_user, login_user, make_token, register_user, update_user,
     optional_user, require_role,
 )
 from agents.legacy_chat_graph import (
@@ -242,6 +242,15 @@ def auth_login(payload: AuthPayload):
     journeys = list_journeys(user["user_id"])
     journey = journeys[0] if journeys else create_journey(user["user_id"], "New chat")
     return {"token": token, "user": user, "journey": journey, "journeys": journeys or [journey]}
+
+
+@app.post("/auth/anonymous")
+def auth_anonymous():
+    """No-login entry — creates a full-access (role=user) anonymous account."""
+    user = create_anonymous_user()
+    token = make_token(user["user_id"], user["email"], user.get("role") or ROLE_USER)
+    journey = create_journey(user["user_id"], "New chat")
+    return {"token": token, "user": user, "journey": journey, "anonymous": True}
 
 
 @app.get("/auth/me")
