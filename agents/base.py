@@ -27,6 +27,7 @@ class AgentState(TypedDict, total=False):
     agent_metadata: dict[str, Any]
     user_role: str
     connectors_available: list[str]
+    workflow: dict[str, Any]
 
 
 # ── Default analysis (fallback) ─────────────────────────────────

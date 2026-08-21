@@ -30,14 +30,14 @@ ORCHESTRATOR_PROMPT = """You are the root orchestrator agent for a legal AI assi
 Read the latest user message and return ONLY valid JSON:
 
 {
-  "intent": "question|draft|review|procedure|compare|document|email|find_lawyer|db_query|other",
+  "intent": "question|draft|review|procedure|compare|document|email|find_lawyer|db_query|case_strategy|compliance|other",
   "domain": "contract|criminal|civil|family|employment|ip|property|tax|constitutional|general",
   "complexity": "simple|medium|complex",
   "jurisdiction": "country or state if mentioned, else unspecified",
   "on_topic": true,
   "summary": "one short sentence describing the user's need",
   "refined_query": "clearer rewrite of the latest user question",
-  "route_to": "assistant|researcher|draft|document_creator|email|lawyer_finder|db_chat"
+  "route_to": "assistant|researcher|draft|document_creator|email|lawyer_finder|db_chat|case_strategy|compliance"
 }
 
 Routing rules:
@@ -54,6 +54,10 @@ Routing rules:
   filter/count/rank lawyers by city, experience, fees, rating, reviews,
   e.g. "show lawyers in Mumbai with 10+ years experience", "how many
   criminal lawyers do you have", "cheapest family lawyers in Delhi") → "db_chat"
+- "case_strategy" (plan a dispute, prepare evidence, evaluate options, map
+  next litigation steps) → "case_strategy"
+- "compliance" (assess a policy, process, business, or document for
+  compliance gaps and controls) → "compliance"
 - Anything else → "assistant"
 
 No markdown, no extra text."""
@@ -69,6 +73,9 @@ INTENT_AGENT_MAP: dict[str, str] = {
     "email": "email",
     "find_lawyer": "lawyer_finder",
     "db_query": "db_chat",
+    "case_strategy": "case_strategy",
+    "compliance": "compliance",
+    "workflow": "workflow_supervisor",
     "other": "assistant",
 }
 
@@ -120,6 +127,20 @@ def analyse_and_route(state: AgentState, config: RunnableConfig) -> dict[str, An
     model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
 
     user_text = latest_user_text(state.get("messages") or [])
+    from agents.workflow_agent import detect_workflow
+    workflow_type = detect_workflow(user_text)
+    if workflow_type:
+        analysis = {
+            "intent": "workflow", "domain": "general", "complexity": "complex",
+            "jurisdiction": "unspecified", "on_topic": True,
+            "summary": f"Run the {workflow_type} multi-agent workflow",
+            "refined_query": user_text, "route_to": "workflow_supervisor",
+            "workflow_type": workflow_type,
+        }
+        return {
+            "analysis": analysis, "routed_to": "workflow_supervisor", "active_agent": "orchestrator",
+            "agent_metadata": {"orchestrator": {"intent": "workflow", "route_to": "workflow_supervisor", "workflow_type": workflow_type}},
+        }
     analyser = _get_analyser_llm(api_key, model)
 
     raw = invoke_text(
@@ -150,7 +171,7 @@ def decide_route(state: AgentState) -> str:
     """Conditional-edge function used by LangGraph to pick the next node."""
     route = (state.get("routed_to") or "assistant").strip()
     # validate against known agents
-    valid = {"assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat"}
+    valid = {"assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance"}
     return route if route in valid else "assistant"
 
 

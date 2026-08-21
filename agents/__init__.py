@@ -13,6 +13,9 @@ from agents.draft_agent import draft_generate
 from agents.document_creator_agent import document_creator_generate
 from agents.lawyer_finder_agent import lawyer_finder_generate
 from agents.db_chat_agent import db_chat_generate
+from agents.workflow_agent import workflow_generate
+from agents.case_strategy_agent import case_strategy_generate
+from agents.compliance_agent import compliance_generate
 
 __all__ = [
     "AGENT_REGISTRY",
@@ -26,4 +29,7 @@ __all__ = [
     "document_creator_generate",
     "lawyer_finder_generate",
     "db_chat_generate",
+    "workflow_generate",
+    "case_strategy_generate",
+    "compliance_generate",
 ]

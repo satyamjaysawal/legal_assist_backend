@@ -27,6 +27,9 @@ from agents.document_creator_agent import document_creator_generate
 from agents.email_agent import email_generate
 from agents.lawyer_finder_agent import lawyer_finder_generate
 from agents.db_chat_agent import db_chat_generate
+from agents.workflow_agent import workflow_generate
+from agents.case_strategy_agent import case_strategy_generate
+from agents.compliance_agent import compliance_generate
 
 
 def build_multi_graph(api_key: str, model: str):
@@ -43,6 +46,9 @@ def build_multi_graph(api_key: str, model: str):
     graph.add_node("email", email_generate)
     graph.add_node("lawyer_finder", lawyer_finder_generate)
     graph.add_node("db_chat", db_chat_generate)
+    graph.add_node("workflow_supervisor", workflow_generate)
+    graph.add_node("case_strategy", case_strategy_generate)
+    graph.add_node("compliance", compliance_generate)
 
     # ── Edges ───────────────────────────────────────────────────
     graph.add_edge(START, "orchestrator")
@@ -59,11 +65,14 @@ def build_multi_graph(api_key: str, model: str):
             "email": "email",
             "lawyer_finder": "lawyer_finder",
             "db_chat": "db_chat",
+            "workflow_supervisor": "workflow_supervisor",
+            "case_strategy": "case_strategy",
+            "compliance": "compliance",
         },
     )
 
     # All specialist agents → END
-    for agent_name in ("assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat"):
+    for agent_name in ("assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance"):
         graph.add_edge(agent_name, END)
 
     return graph.compile()
@@ -138,6 +147,9 @@ def stream_multi_graph(
                     yield {"type": "agent_start", "agent": routed_to}
                 else:
                     reply = (node_state.get("reply") or "").strip()
+                    workflow = node_state.get("workflow")
+                    if workflow:
+                        yield {"type": "workflow", "workflow": workflow}
                     yield {
                         "type": "agent_done",
                         "agent": node_name,

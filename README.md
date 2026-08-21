@@ -48,6 +48,14 @@ FastAPI chat API powering a **multi-agent legal AI assistant**: LangGraph orches
 
 ## Agents
 
+### POC workflow supervisor
+
+The `workflow_supervisor` demonstrates real bounded orchestration with the
+existing specialist agents. Use explicit chat prompts beginning with
+`workflow: sequential`, `workflow: parallel`, `workflow: supervisor`,
+`workflow: loop`, or `workflow: cycle`. Loop and cyclic modes have fixed
+limits, so a demo request cannot run indefinitely.
+
 | Agent | Handles intents | Role | Bound tools |
 | --- | --- | --- | --- |
 | `orchestrator` | `*` | Root agent — analyses intent and routes to specialists | — |
@@ -58,6 +66,9 @@ FastAPI chat API powering a **multi-agent legal AI assistant**: LangGraph orches
 | `email` | email | Professional legal email composition | — (deterministic) |
 | `lawyer_finder` | find_lawyer | Lawyer directory search + live chat entry point | `list_lawyers`, `query_lawyer_database` |
 | `db_chat` | db_query | Text-to-SQL over the Neon lawyer directory | `query_lawyer_database` |
+| `case_strategy` | case_strategy | Dispute planning, evidence checklists, and procedural options | `search_bare_acts`, `define_legal_term` |
+| `compliance` | compliance | Policy/process compliance gaps and control checklists | `search_bare_acts`, `define_legal_term` |
+| `workflow_supervisor` | workflow | Sequential, parallel, subagent, loop, and cyclic POC workflows | delegates to existing specialists |
 
 ## Connectors
 

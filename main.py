@@ -863,6 +863,15 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     elif db_info.get("error"):
                         detail = f"Query failed — {db_info['error'][:80]}"
                     yield step(agent, "done", detail)
+                elif etype == "workflow":
+                    workflow = event.get("workflow") or {}
+                    stages = workflow.get("stages") or []
+                    yield step(
+                        "workflow_supervisor",
+                        "done",
+                        f"{workflow.get('label') or 'Workflow'}: {' -> '.join(stages)}",
+                    )
+                    yield sse({"type": "workflow", "workflow": workflow})
                 elif etype == "token":
                     reply_parts.append(event.get("content") or "")
                     yield sse(event)
