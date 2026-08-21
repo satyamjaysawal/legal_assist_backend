@@ -27,6 +27,7 @@ from agents.legacy_chat_graph import (
     suggest_title,
 )
 from agents.multi_agent_graph import build_multi_graph, stream_multi_graph
+from agents.workflow_agent import resume_hitl
 from agents.base import list_agents as list_registered_agents
 from connectors import list_connectors
 from connectors.base import get_connector
@@ -45,6 +46,7 @@ from services.cache_service import (
 from services.document_processing import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, chunk_text, parse_file
 from services.embedding_service import embed_status
 from services.file_storage import files_status, get_original_file, store_original_file
+from services.hitl_service import claim_checkpoint
 from services.memory_service import (
     compress_history,
     get_procedural_memory,
@@ -794,6 +796,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
             analysis = None
             routed_to = "assistant"
             specialist_meta: dict[str, Any] = {}
+            hitl_paused = False
     
             yield sse({"type": "thinking", "text": "Root agent classifying intent…"})
             yield step("orchestrator", "running", "Root agent reading query → intent · domain · complexity")
@@ -808,6 +811,8 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                 user_profile=profile_text,
                 episodic_notes=loaded.get("episodic_notes", ""),
                 procedural_notes=loaded.get("procedural_notes", ""),
+                user_id=user_id,
+                journey_id=journey_id,
             ):
                 etype = event.get("type")
                 if etype == "agent_route":
@@ -930,6 +935,11 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                         },
                     })
                     yield sse({"type": "workflow", "workflow": workflow})
+                elif etype == "hitl":
+                    # Human-in-the-loop approval request — surfaced as an
+                    # in-chat approval box by the frontend.
+                    hitl_paused = True
+                    yield sse(event)
                 elif etype == "token":
                     reply_parts.append(event.get("content") or "")
                     yield sse(event)
@@ -963,16 +973,16 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                 # Error replies (e.g. failed text-to-SQL) must never be cached,
                 # or the failure would replay from cache for the whole TTL.
                 cache_error = bool(((specialist_meta.get(routed_to) or {}).get("cache_error")))
-                if cache_error:
+                if cache_error or hitl_paused:
                     exact_write = {
                         "name": "prompt_cache",
                         "label": "Prompt cache",
                         "wrote": False,
                         "store": None,
                         "when": datetime.now(timezone.utc).isoformat(),
-                        "detail": "Skipped — error reply is not cacheable",
+                        "detail": "Skipped — error reply is not cacheable" if cache_error else "Skipped — paused HITL workflow is not cacheable",
                     }
-                    logger.info("Cache write skipped for %s (agent reported cache_error)", routed_to)
+                    logger.info("Cache write skipped for %s (%s)", routed_to, "cache_error" if cache_error else "hitl paused")
                 else:
                     exact_write = set_prompt_cache(
                         query,
@@ -1026,6 +1036,92 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
         except Exception as exc:
             logger.exception("Multi-agent pipeline error")
             yield sse({"type": "error", "detail": f"Multi-agent error: {exc}"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+class HitlResumeRequest(BaseModel):
+    request_id: str
+    decision: str  # approve | reject | changes | regenerate
+    comment: str = ""
+
+
+@app.post("/chat/hitl/resume")
+def chat_hitl_resume(req: HitlResumeRequest, user: dict = Depends(current_user)):
+    """Resume a paused human-in-the-loop workflow with the human's decision."""
+    api_key = require_key()
+    decision = (req.decision or "").strip().lower()
+    if decision not in {"approve", "reject", "changes", "regenerate"}:
+        raise HTTPException(status_code=400, detail="decision must be one of: approve, reject, changes, regenerate")
+    user_id = user["user_id"]
+    checkpoint = claim_checkpoint(user_id, (req.request_id or "").strip())
+    if not checkpoint:
+        raise HTTPException(status_code=404, detail="Approval checkpoint not found, expired, or already used")
+    journey_id = checkpoint.get("journey_id") or ""
+    comment = (req.comment or "").strip()[:2000]
+    config = {
+        "configurable": {"api_key": api_key, "model": GROQ_MODEL, "user_id": user_id, "journey_id": journey_id}
+    }
+
+    def generate():
+        reply_parts: list[str] = []
+        try:
+            yield sse({"type": "thinking", "text": f"Resuming workflow with your decision ({decision})…"})
+            for event in resume_hitl(checkpoint, decision, comment, config):
+                etype = event.get("type")
+                if etype == "agent_start":
+                    agent = event.get("agent") or ""
+                    yield sse({
+                        "type": "stage",
+                        "stage": {
+                            "stage_id": event.get("stage_id") or agent,
+                            "agent": agent,
+                            "status": "running",
+                            "parent_stage_id": event.get("parent_stage_id") or "",
+                            "input": event.get("input") or "",
+                        },
+                    })
+                elif etype == "agent_done":
+                    agent = event.get("agent") or ""
+                    yield sse({
+                        "type": "stage",
+                        "stage": {
+                            "stage_id": event.get("stage_id") or agent,
+                            "agent": agent,
+                            "status": "failed" if event.get("failed") else "done",
+                            "parent_stage_id": event.get("parent_stage_id") or "",
+                            "input": event.get("input") or "",
+                            "reply": event.get("reply") or "",
+                            "truncated": bool(event.get("truncated")),
+                        },
+                    })
+                elif etype == "workflow":
+                    yield sse({"type": "workflow", "workflow": event.get("workflow") or {}})
+                elif etype == "token":
+                    reply_parts.append(event.get("content") or "")
+                    yield sse(event)
+                elif etype in {"hitl", "error", "done"}:
+                    yield sse(event)
+
+            reply = "".join(reply_parts).strip()
+            if reply and journey_id:
+                # Persist the human decision + final output into the journey.
+                try:
+                    journey = get_journey(user_id, journey_id)
+                    stored = (journey.get("messages") or []) + [
+                        {"role": "user", "content": f"[Approval] {decision}" + (f" — {comment}" if comment else "")},
+                        {"role": "assistant", "content": reply},
+                    ]
+                    save_all(journey_id, user_id, stored, journey.get("title") or "Workflow", reply, None)
+                except Exception:
+                    logger.warning("HITL resume: journey persistence failed")
+        except Exception as exc:
+            logger.exception("HITL resume error")
+            yield sse({"type": "error", "detail": f"HITL resume error: {exc}"})
 
     return StreamingResponse(
         generate(),

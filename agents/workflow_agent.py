@@ -9,6 +9,7 @@ cannot recurse indefinitely.
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Iterator
+from uuid import uuid4
 
 import logging
 
@@ -21,6 +22,7 @@ from agents.document_creator_agent import document_creator_generate
 from agents.draft_agent import draft_generate
 from agents.email_agent import email_generate
 from agents.researcher_agent import researcher_generate
+from services.hitl_service import save_checkpoint
 
 logger = logging.getLogger("legal_assist.agents.workflow")
 
@@ -28,6 +30,20 @@ MAX_REFINEMENT_PASSES = 2
 # Per-stage replies are echoed to the UI for flow visibility; cap the payload.
 MAX_STAGE_REPLY_CHARS = 6000
 SUPERVISOR_STAGE = "workflow_supervisor:0"
+
+# Options surfaced in the in-chat approval box (Claude-Code style HITL).
+HITL_OPTIONS = [
+    {"id": "approve", "label": "Yes, approve"},
+    {"id": "reject", "label": "No, reject"},
+    {"id": "changes", "label": "Request changes"},
+    {"id": "regenerate", "label": "Regenerate draft"},
+]
+HITL_DECISION_LABELS = {
+    "approve": "✅ Approved by human",
+    "reject": "❌ Rejected by human",
+    "changes": "✏️ Changes requested by human",
+    "regenerate": "🔁 Regeneration requested by human",
+}
 
 WORKFLOW_DEFINITIONS = {
     "sequential": {
@@ -277,15 +293,176 @@ def stream_workflow(state: AgentState, config: RunnableConfig, mode: str) -> Ite
         results.append(checkpoint)
         latest_stage = stage_id
         yield _stage_event("agent_done", checkpoint, "human_review", stage_id, draft_parent, draft["reply"])
-        yield from run_stage("researcher", f"Perform a legal quality review of this human-review draft and list material corrections:\n{draft['reply']}", draft_parent)
-        review_parent = latest_stage
-        review = results[-1]
-        yield from run_stage("draft", f"Prepare a final draft that incorporates the legal review. It remains subject to the human approval checkpoint:\n{review['reply']}", review_parent)
+        # ── PAUSE: wait for the human decision instead of auto-continuing ──
+        yield from _pause_for_approval(state, config, results, nodes, counter, draft, stage_id)
+        return
 
     definition = WORKFLOW_DEFINITIONS[mode]
     workflow = {"mode": mode, **definition, "stages": [item["agent"] for item in results], "nodes": nodes, "human_in_loop": mode == "hitl"}
     yield {"type": "workflow", "workflow": workflow}
     yield {"type": "token", "content": _render(mode, results)}
+    yield {"type": "done", "agent": "workflow_supervisor"}
+
+
+def _pause_for_approval(
+    state: AgentState,
+    config: RunnableConfig,
+    results: list[dict[str, Any]],
+    nodes: list[dict[str, str]],
+    counter: int,
+    draft: dict[str, Any],
+    checkpoint_stage_id: str,
+) -> Iterator[dict[str, Any]]:
+    """Persist the paused workflow state and ask the human for a decision.
+
+    Serverless-safe: the stream cannot stay open while a human thinks, so the
+    full stage tree is saved to the checkpoint store and the response ends.
+    ``POST /chat/hitl/resume`` continues the workflow with the decision.
+    """
+    request_id = str(uuid4())
+    configurable = (config or {}).get("configurable") or {}
+    save_checkpoint({
+        "request_id": request_id,
+        "user_id": configurable.get("user_id") or "",
+        "journey_id": configurable.get("journey_id") or "",
+        "query": (state.get("messages") or [{}])[-1].get("content", ""),
+        "mode": "hitl",
+        "counter": counter,
+        "nodes": nodes,
+        # Cap each stored reply so the checkpoint stays small.
+        "results": [{**item, "reply": (item.get("reply") or "")[:MAX_STAGE_REPLY_CHARS]} for item in results],
+        "draft_reply": draft.get("reply", ""),
+        "checkpoint_stage_id": checkpoint_stage_id,
+        "state_extras": {
+            key: state.get(key) or ""
+            for key in ("memory_notes", "rag_notes", "user_profile", "episodic_notes", "procedural_notes", "user_role")
+        },
+    })
+    yield {
+        "type": "hitl",
+        "request_id": request_id,
+        "stage_id": checkpoint_stage_id,
+        "question": "Do you approve this draft?",
+        "draft": (draft.get("reply") or "")[:MAX_STAGE_REPLY_CHARS],
+        "options": HITL_OPTIONS,
+    }
+    definition = WORKFLOW_DEFINITIONS["hitl"]
+    yield {"type": "workflow", "workflow": {
+        "mode": "hitl", **definition,
+        "stages": [item["agent"] for item in results],
+        "nodes": nodes,
+        "human_in_loop": True,
+        "paused": True,
+    }}
+    yield {"type": "token", "content": (
+        "⏸️ **Workflow paused — waiting for your approval.**\n\n"
+        "Use the approval box above to **approve**, **request changes**, "
+        "**regenerate**, or **reject** the draft."
+    )}
+    yield {"type": "done", "agent": "workflow_supervisor"}
+
+
+def _state_from_checkpoint(checkpoint: dict[str, Any]) -> AgentState:
+    """Rebuild a runnable AgentState from the paused checkpoint."""
+    extras = checkpoint.get("state_extras") or {}
+    return {
+        "messages": [{"role": "user", "content": checkpoint.get("query") or ""}],
+        "analysis": None,
+        "reply": "",
+        "memory_notes": extras.get("memory_notes") or "",
+        "rag_notes": extras.get("rag_notes") or "",
+        "user_profile": extras.get("user_profile") or "",
+        "episodic_notes": extras.get("episodic_notes") or "",
+        "procedural_notes": extras.get("procedural_notes") or "",
+        "active_agent": "workflow_supervisor",
+        "routed_to": "workflow_supervisor",
+        "agent_metadata": {},
+        "user_role": extras.get("user_role") or "user",
+        "connectors_available": [],
+    }
+
+
+def resume_hitl(
+    checkpoint: dict[str, Any],
+    decision: str,
+    comment: str = "",
+    config: RunnableConfig | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Continue a paused HITL workflow after the human decision.
+
+    Decisions: ``approve`` / ``changes`` run the quality review + final draft,
+    ``regenerate`` re-drafts and pauses at a fresh checkpoint, ``reject`` ends
+    the workflow with the recorded decision.
+    """
+    decision = (decision or "").lower()
+    if decision not in HITL_DECISION_LABELS:
+        yield {"type": "error", "detail": f"Unknown HITL decision: {decision}"}
+        return
+
+    config = config or {}
+    state = _state_from_checkpoint(checkpoint)
+    results: list[dict[str, Any]] = [dict(item) for item in checkpoint.get("results") or []]
+    nodes: list[dict[str, str]] = [dict(item) for item in checkpoint.get("nodes") or []]
+    counter = int(checkpoint.get("counter") or 0)
+    checkpoint_stage = checkpoint.get("checkpoint_stage_id") or ""
+    draft_reply = checkpoint.get("draft_reply") or ""
+    comment = (comment or "").strip()
+
+    def run_stage(agent: str, context: str, parent: str) -> Iterator[dict[str, Any]]:
+        nonlocal counter
+        counter += 1
+        stage_id = f"{agent}:{counter}"
+        nodes.append({"stage_id": stage_id, "agent": agent, "parent_stage_id": parent})
+        yield _stage_event("agent_start", None, agent, stage_id, parent, context)
+        result = _safe_run(agent, state, config, context)
+        results.append(result)
+        yield _stage_event("agent_done", result, agent, stage_id, parent, context)
+
+    # Record the human decision as its own visible stage in the tree.
+    decision_text = HITL_DECISION_LABELS[decision] + (f" — {comment}" if comment else "")
+    counter += 1
+    decision_stage = f"human_decision:{counter}"
+    nodes.append({"stage_id": decision_stage, "agent": "human_decision", "parent_stage_id": checkpoint_stage})
+    decision_result = {"agent": "human_decision", "reply": decision_text, "metadata": {"human_in_loop": True, "decision": decision}, "input": draft_reply}
+    yield _stage_event("agent_start", None, "human_decision", decision_stage, checkpoint_stage, draft_reply)
+    results.append(decision_result)
+    yield _stage_event("agent_done", decision_result, "human_decision", decision_stage, checkpoint_stage, draft_reply)
+
+    if decision == "reject":
+        pass  # workflow ends with the recorded rejection
+    elif decision == "regenerate":
+        regen_context = "Regenerate the draft from scratch, fixing the problems below."
+        if comment:
+            regen_context += f"\nHuman feedback:\n{comment}"
+        regen_context += f"\nCurrent draft to improve:\n{draft_reply}"
+        yield from run_stage("draft", regen_context, decision_stage)
+        draft = results[-1]
+        counter += 1
+        new_checkpoint = {"agent": "human_review", "reply": "Human approval checkpoint: review the regenerated draft and approve or request further changes.", "metadata": {"human_in_loop": True}, "input": draft["reply"]}
+        stage_id = f"human_review:{counter}"
+        nodes.append({"stage_id": stage_id, "agent": "human_review", "parent_stage_id": decision_stage})
+        yield _stage_event("agent_start", None, "human_review", stage_id, decision_stage, draft["reply"])
+        results.append(new_checkpoint)
+        yield _stage_event("agent_done", new_checkpoint, "human_review", stage_id, decision_stage, draft["reply"])
+        # Pause again at the fresh checkpoint.
+        yield from _pause_for_approval(state, config, results, nodes, counter, draft, stage_id)
+        return
+    else:  # approve / changes
+        feedback = f"\nHuman feedback that MUST be incorporated:\n{comment}" if comment else ""
+        yield from run_stage("researcher", f"Perform a legal quality review of this human-reviewed draft and list material corrections:{feedback}\n{draft_reply}", decision_stage)
+        review = results[-1]
+        yield from run_stage("draft", f"Prepare a final draft that incorporates the legal review{feedback}:\n{review['reply']}", f"researcher:{counter}")
+
+    definition = WORKFLOW_DEFINITIONS["hitl"]
+    yield {"type": "workflow", "workflow": {
+        "mode": "hitl", **definition,
+        "stages": [item["agent"] for item in results],
+        "nodes": nodes,
+        "human_in_loop": True,
+        "paused": False,
+        "decision": decision,
+    }}
+    yield {"type": "token", "content": _render("hitl", results)}
     yield {"type": "done", "agent": "workflow_supervisor"}
 
 

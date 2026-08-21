@@ -98,6 +98,8 @@ def stream_multi_graph(
     user_profile: str = "",
     episodic_notes: str = "",
     procedural_notes: str = "",
+    user_id: str = "",
+    journey_id: str = "",
 ) -> Iterator[dict[str, Any]]:
     """Stream events from the multi-agent graph.
 
@@ -116,6 +118,9 @@ def stream_multi_graph(
         "configurable": {
             "api_key": api_key,
             "model": model,
+            # Identity travels with the run so HITL checkpoints know their owner.
+            "user_id": user_id,
+            "journey_id": journey_id,
         }
     }
 
