@@ -43,7 +43,12 @@ LangGraph multi-agent graph (agents/multi_agent_graph.py)
    ├─ document_creator — structured documents        [tools: list_legal_templates, get_legal_template]
    ├─ email            — email composition           [deterministic]
    ├─ lawyer_finder    — lawyer directory + live chat[tools: list_lawyers, query_lawyer_database]
-   └─ db_chat          — text-to-SQL on Neon Postgres[tools: query_lawyer_database]
+   ├─ db_chat          — text-to-SQL on Neon Postgres[tools: query_lawyer_database]
+   ├─ case_strategy    — evidence and dispute planning [research tools]
+   ├─ compliance       — controls and compliance gaps  [research tools]
+   ├─ negotiation      — settlement/counterproposals   [research tools]
+   ├─ risk_assessment  — ranked legal risk register    [research tools]
+   └─ workflow_supervisor — sequential, parallel, cyclic, and HITL workflows
 
    Every specialist runs an AGENTIC TOOL LOOP (LangChain bind_tools +
    LangGraph agent⇄ToolNode) — the LLM decides when to call which tool
@@ -69,7 +74,7 @@ tool loop (`agents/tool_loop_runner.py` → `run_agent_with_tools`).
 ### 3.1 Orchestrator (`orchestrator_agent.py`) — Root agent
 - Classifies every query: **intent**, **domain**, **complexity**, **jurisdiction**, on-topic check.
 - Produces a refined query and picks the specialist (`route_to`).
-- Intents: `question`, `procedure`, `review`, `compare`, `draft`, `document`, `email`, `find_lawyer`, `db_query`, `other`.
+- Intents: `question`, `procedure`, `review`, `compare`, `draft`, `document`, `email`, `find_lawyer`, `db_query`, `case_strategy`, `compliance`, `negotiation`, `risk_assessment`, `other`.
 
 ### 3.2 Assistant (`assistant_agent.py`)
 - Handles `question`, `procedure`, `other`.
@@ -109,7 +114,21 @@ tool loop (`agents/tool_loop_runner.py` → `run_agent_with_tools`).
 - The **executed SQL is sent to the UI** as a dedicated `sql` SSE event and rendered in a code card (same contract in both paths — the agent lifts the SQL from the tool's ToolMessage payload).
 - Error replies are flagged `cache_error` so failures are **never cached**.
 
-### 3.9 The Agentic Tool-Binding Pattern — how to add any new use case
+### 3.9 Case Strategy, Compliance, Negotiation, and Risk Assessment
+- **Case Strategy** turns a dispute into objectives, missing facts, evidence, options, deadlines to verify, and risks.
+- **Compliance** identifies policy/process gaps, controls, owners, and counsel questions.
+- **Negotiation** creates settlement goals, proposed terms, fallback options, and counterproposals.
+- **Risk Assessment** produces a severity-ranked risk register with mitigations, evidence retention, and escalation points.
+- All four use the same bounded research-tool loop and clearly state that they are educational POC outputs rather than legal advice.
+
+### 3.10 Workflow Supervisor and human-in-the-loop (HITL)
+- Explicit `workflow:` prompts demonstrate sequential hand-offs, parallel specialists, supervisor-to-subagent delegation, bounded refinement loops, cyclic review, and `workflow: hitl`.
+- The root routing graph and every workflow specialist stage are compiled with **LangGraph `StateGraph`**. Each specialist stage in turn uses the shared **LangChain `bind_tools` + ToolNode** loop when tools are applicable.
+- The HITL flow is: **Researcher → Draft → Human approval checkpoint → Researcher quality review → Draft**.
+- The checkpoint visibly asks the user to verify facts, names, dates, amounts, jurisdiction, remedy, and tone, then reply with approval or requested changes before relying on or sending a document.
+- Automated refinement remains bounded; a human never needs to trust an unreviewed legal draft.
+
+### 3.11 The Agentic Tool-Binding Pattern — how to add any new use case
 
 This is the canonical pattern of the project. Follow these steps for
 every new feature so it plugs into the pipeline identically.
@@ -256,6 +275,7 @@ React + Vite + **Tailwind CSS only** (`src/App.jsx`), deployed at https://legal-
 - **🗄 Executed SQL card** — full SQL, rows fetched, tables, columns for db_chat answers
 - **💬 Lawyer Chat panel** — directory, room creation, WebSocket chat, status pills, end session
 - **HITL Draft-Fill wizard** — guided field-by-field personalization before download/email
+- **Agent Guide** — runnable samples for specialist routes and sequential, parallel, supervisor, loop, cyclic, and HITL orchestration flows; each shows the expected result and flow.
 - **Download & Send Email** actions for draft/document/email replies (PDF · DOCX · TXT)
 - Markdown replies with tables, journey sidebar (rename/delete), auto titles, follow-up chips
 - Memory viewer page (profile, stores, episodes, preferences, facts, files)

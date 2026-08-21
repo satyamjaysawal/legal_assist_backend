@@ -19,6 +19,8 @@ EXPECTED_AGENTS = {
     "workflow_supervisor",
     "case_strategy",
     "compliance",
+    "negotiation",
+    "risk_assessment",
 }
 
 

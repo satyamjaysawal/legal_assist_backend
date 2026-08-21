@@ -7,7 +7,7 @@ from agents.orchestrator_agent import INTENT_AGENT_MAP, decide_route, parse_anal
 
 def test_intent_agent_map_covers_all_agents():
     expected_agents = {"assistant", "researcher", "draft", "document_creator",
-                       "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance"}
+                       "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance", "negotiation", "risk_assessment"}
     assert set(INTENT_AGENT_MAP.values()) == expected_agents
 
 
@@ -53,7 +53,7 @@ def test_parse_analysis_routes_the_extra_specialists():
 
 def test_decide_route_valid_routes():
     for agent in ("assistant", "researcher", "draft", "document_creator",
-                  "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance"):
+                  "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance", "negotiation", "risk_assessment"):
         assert decide_route({"routed_to": agent}) == agent
 
 

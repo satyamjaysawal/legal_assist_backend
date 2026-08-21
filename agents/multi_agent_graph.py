@@ -27,9 +27,11 @@ from agents.document_creator_agent import document_creator_generate
 from agents.email_agent import email_generate
 from agents.lawyer_finder_agent import lawyer_finder_generate
 from agents.db_chat_agent import db_chat_generate
-from agents.workflow_agent import workflow_generate
+from agents.workflow_agent import detect_workflow, stream_workflow, workflow_generate
 from agents.case_strategy_agent import case_strategy_generate
 from agents.compliance_agent import compliance_generate
+from agents.negotiation_agent import negotiation_generate
+from agents.risk_assessment_agent import risk_assessment_generate
 
 
 def build_multi_graph(api_key: str, model: str):
@@ -49,6 +51,8 @@ def build_multi_graph(api_key: str, model: str):
     graph.add_node("workflow_supervisor", workflow_generate)
     graph.add_node("case_strategy", case_strategy_generate)
     graph.add_node("compliance", compliance_generate)
+    graph.add_node("negotiation", negotiation_generate)
+    graph.add_node("risk_assessment", risk_assessment_generate)
 
     # ── Edges ───────────────────────────────────────────────────
     graph.add_edge(START, "orchestrator")
@@ -68,11 +72,13 @@ def build_multi_graph(api_key: str, model: str):
             "workflow_supervisor": "workflow_supervisor",
             "case_strategy": "case_strategy",
             "compliance": "compliance",
+            "negotiation": "negotiation",
+            "risk_assessment": "risk_assessment",
         },
     )
 
     # All specialist agents → END
-    for agent_name in ("assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance"):
+    for agent_name in ("assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance", "negotiation", "risk_assessment"):
         graph.add_edge(agent_name, END)
 
     return graph.compile()
@@ -109,25 +115,46 @@ def stream_multi_graph(
         }
     }
 
+    initial_state: AgentState = {
+        "messages": messages,
+        "analysis": None,
+        "reply": "",
+        "memory_notes": memory_notes,
+        "rag_notes": rag_notes,
+        "user_profile": user_profile,
+        "episodic_notes": episodic_notes,
+        "procedural_notes": procedural_notes,
+        "active_agent": "",
+        "routed_to": "",
+        "agent_metadata": {},
+        "user_role": user_role,
+        "connectors_available": [],
+    }
+
     try:
+        # Workflows have their own streaming executor so every child-agent
+        # call reaches the UI as it starts and completes.
+        workflow_mode = detect_workflow(messages[-1].get("content", "") if messages else "")
+        if workflow_mode:
+            routed = analyse_and_route(initial_state, config)
+            analysis = routed.get("analysis") or {}
+            yield {
+                "type": "agent_route",
+                "routed_to": "workflow_supervisor",
+                "analysis": analysis,
+                "active_agent": "orchestrator",
+                "agent_metadata": routed.get("agent_metadata") or {},
+            }
+            yield {"type": "analysis", "analysis": analysis, "model": model}
+            yield {"type": "agent_start", "agent": "workflow_supervisor", "stage_id": "workflow_supervisor:0"}
+            for event in stream_workflow(initial_state, config, workflow_mode):
+                yield event
+            return
+
         routed_to = "assistant"
         reply = ""
         for update in compiled.stream(
-            {
-                "messages": messages,
-                "analysis": None,
-                "reply": "",
-                "memory_notes": memory_notes,
-                "rag_notes": rag_notes,
-                "user_profile": user_profile,
-                "episodic_notes": episodic_notes,
-                "procedural_notes": procedural_notes,
-                "active_agent": "",
-                "routed_to": "",
-                "agent_metadata": {},
-                "user_role": user_role,
-                "connectors_available": [],
-            },
+            initial_state,
             config=config,
             stream_mode="updates",
         ):

@@ -675,12 +675,13 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
         try:
             flow: list[dict] = []
     
-            def step(name, status, detail=""):
-                """Emit a pipeline step (replaces any earlier step with the same name)."""
-                item = {"name": name, "status": status, "detail": detail}
-                flow[:] = [f for f in flow if f["name"] != name]
+            def step(name, status, detail="", stage_id=""):
+                """Emit a pipeline step; stage IDs preserve repeated loop calls."""
+                key = stage_id or name
+                item = {"name": key, "display_name": name.split(":", 1)[0], "status": status, "detail": detail}
+                flow[:] = [f for f in flow if f["name"] != key]
                 flow.append(item)
-                return sse({"type": "flow", "steps": flow[:], "current": name})
+                return sse({"type": "flow", "steps": flow[:], "current": key})
     
             # ── Greeting fast-path ──
             if _is_simple_greeting(query):
@@ -835,10 +836,12 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     yield sse({"type": "analysis", "analysis": analysis, "model": GROQ_MODEL})
                 elif etype == "agent_start":
                     agent = event.get("agent") or routed_to
+                    agent = event.get("stage_id") or agent
                     yield step(agent, "running", f"{agent} agent generating reply…")
                     yield sse({"type": "thinking", "text": f"{agent} agent is writing…"})
                 elif etype == "agent_done":
                     agent = event.get("agent") or routed_to
+                    agent = event.get("stage_id") or agent
                     specialist_meta = event.get("agent_metadata") or {}
                     detail = f"Reply generated · {event.get('reply_chars') or 0} characters"
                     # Agentic visibility — which tools the agent called

@@ -30,14 +30,14 @@ ORCHESTRATOR_PROMPT = """You are the root orchestrator agent for a legal AI assi
 Read the latest user message and return ONLY valid JSON:
 
 {
-  "intent": "question|draft|review|procedure|compare|document|email|find_lawyer|db_query|case_strategy|compliance|other",
+  "intent": "question|draft|review|procedure|compare|document|email|find_lawyer|db_query|case_strategy|compliance|negotiation|risk_assessment|other",
   "domain": "contract|criminal|civil|family|employment|ip|property|tax|constitutional|general",
   "complexity": "simple|medium|complex",
   "jurisdiction": "country or state if mentioned, else unspecified",
   "on_topic": true,
   "summary": "one short sentence describing the user's need",
   "refined_query": "clearer rewrite of the latest user question",
-  "route_to": "assistant|researcher|draft|document_creator|email|lawyer_finder|db_chat|case_strategy|compliance"
+  "route_to": "assistant|researcher|draft|document_creator|email|lawyer_finder|db_chat|case_strategy|compliance|negotiation|risk_assessment"
 }
 
 Routing rules:
@@ -58,6 +58,10 @@ Routing rules:
   next litigation steps) → "case_strategy"
 - "compliance" (assess a policy, process, business, or document for
   compliance gaps and controls) → "compliance"
+- "negotiation" (prepare settlement options, a negotiation plan, or a
+  counterproposal) → "negotiation"
+- "risk_assessment" (identify legal risks, severity, mitigations, and
+  escalation points in a situation or document) → "risk_assessment"
 - Anything else → "assistant"
 
 No markdown, no extra text."""
@@ -75,6 +79,8 @@ INTENT_AGENT_MAP: dict[str, str] = {
     "db_query": "db_chat",
     "case_strategy": "case_strategy",
     "compliance": "compliance",
+    "negotiation": "negotiation",
+    "risk_assessment": "risk_assessment",
     "workflow": "workflow_supervisor",
     "other": "assistant",
 }
@@ -171,7 +177,7 @@ def decide_route(state: AgentState) -> str:
     """Conditional-edge function used by LangGraph to pick the next node."""
     route = (state.get("routed_to") or "assistant").strip()
     # validate against known agents
-    valid = {"assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance"}
+    valid = {"assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance", "negotiation", "risk_assessment"}
     return route if route in valid else "assistant"
 
 

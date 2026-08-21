@@ -16,6 +16,8 @@ from agents.db_chat_agent import db_chat_generate
 from agents.workflow_agent import workflow_generate
 from agents.case_strategy_agent import case_strategy_generate
 from agents.compliance_agent import compliance_generate
+from agents.negotiation_agent import negotiation_generate
+from agents.risk_assessment_agent import risk_assessment_generate
 
 __all__ = [
     "AGENT_REGISTRY",
@@ -32,4 +34,6 @@ __all__ = [
     "workflow_generate",
     "case_strategy_generate",
     "compliance_generate",
+    "negotiation_generate",
+    "risk_assessment_generate",
 ]
