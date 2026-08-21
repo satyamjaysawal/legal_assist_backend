@@ -146,7 +146,14 @@ def stream_multi_graph(
                 "agent_metadata": routed.get("agent_metadata") or {},
             }
             yield {"type": "analysis", "analysis": analysis, "model": model}
-            yield {"type": "agent_start", "agent": "workflow_supervisor", "stage_id": "workflow_supervisor:0"}
+            user_query = messages[-1].get("content", "") if messages else ""
+            yield {
+                "type": "agent_start",
+                "agent": "workflow_supervisor",
+                "stage_id": "workflow_supervisor:0",
+                "parent_stage_id": "orchestrator:0",
+                "input": user_query,
+            }
             for event in stream_workflow(initial_state, config, workflow_mode):
                 yield event
             return
@@ -171,7 +178,14 @@ def stream_multi_graph(
                     }
                     if analysis:
                         yield {"type": "analysis", "analysis": analysis, "model": model}
-                    yield {"type": "agent_start", "agent": routed_to}
+                    user_query = messages[-1].get("content", "") if messages else ""
+                    yield {
+                        "type": "agent_start",
+                        "agent": routed_to,
+                        "stage_id": f"{routed_to}:1",
+                        "parent_stage_id": "orchestrator:0",
+                        "input": user_query,
+                    }
                 else:
                     reply = (node_state.get("reply") or "").strip()
                     workflow = node_state.get("workflow")
@@ -180,6 +194,10 @@ def stream_multi_graph(
                     yield {
                         "type": "agent_done",
                         "agent": node_name,
+                        "stage_id": f"{node_name}:1",
+                        "parent_stage_id": "orchestrator:0",
+                        "reply": reply[:6000],
+                        "truncated": len(reply) > 6000,
                         "reply_chars": len(reply),
                         "agent_metadata": node_state.get("agent_metadata") or {},
                     }

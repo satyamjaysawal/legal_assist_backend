@@ -831,17 +831,41 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                         "metadata": event.get("agent_metadata") or {},
                     })
                     yield sse({"type": "thinking", "text": f"Routed to {routed_to} agent…"})
+                    yield sse({
+                        "type": "stage",
+                        "stage": {
+                            "stage_id": "orchestrator:0",
+                            "agent": "orchestrator",
+                            "status": "done",
+                            "parent_stage_id": "",
+                            "input": query,
+                            "reply": (
+                                f"intent={a.get('intent')} · domain={a.get('domain')} · "
+                                f"complexity={a.get('complexity')} → routed to {routed_to}"
+                            ),
+                        },
+                    })
                 elif etype == "analysis":
                     analysis = event.get("analysis")
                     yield sse({"type": "analysis", "analysis": analysis, "model": GROQ_MODEL})
                 elif etype == "agent_start":
-                    agent = event.get("agent") or routed_to
-                    agent = event.get("stage_id") or agent
-                    yield step(agent, "running", f"{agent} agent generating reply…")
-                    yield sse({"type": "thinking", "text": f"{agent} agent is writing…"})
+                    raw_agent = event.get("agent") or routed_to
+                    agent = event.get("stage_id") or raw_agent
+                    yield step(agent, "running", f"{raw_agent} agent generating reply…")
+                    yield sse({"type": "thinking", "text": f"{raw_agent} agent is writing…"})
+                    yield sse({
+                        "type": "stage",
+                        "stage": {
+                            "stage_id": agent,
+                            "agent": raw_agent,
+                            "status": "running",
+                            "parent_stage_id": event.get("parent_stage_id") or "",
+                            "input": event.get("input") or "",
+                        },
+                    })
                 elif etype == "agent_done":
-                    agent = event.get("agent") or routed_to
-                    agent = event.get("stage_id") or agent
+                    raw_agent = event.get("agent") or routed_to
+                    agent = event.get("stage_id") or raw_agent
                     specialist_meta = event.get("agent_metadata") or {}
                     detail = f"Reply generated · {event.get('reply_chars') or 0} characters"
                     # Agentic visibility — which tools the agent called
@@ -866,6 +890,18 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     elif db_info.get("error"):
                         detail = f"Query failed — {db_info['error'][:80]}"
                     yield step(agent, "done", detail)
+                    yield sse({
+                        "type": "stage",
+                        "stage": {
+                            "stage_id": agent,
+                            "agent": raw_agent,
+                            "status": "failed" if event.get("failed") else "done",
+                            "parent_stage_id": event.get("parent_stage_id") or "",
+                            "input": event.get("input") or "",
+                            "reply": event.get("reply") or "",
+                            "truncated": bool(event.get("truncated")),
+                        },
+                    })
                 elif etype == "workflow":
                     workflow = event.get("workflow") or {}
                     stages = workflow.get("stages") or []
@@ -874,6 +910,18 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                         "done",
                         f"{workflow.get('label') or 'Workflow'}: {' -> '.join(stages)}",
                     )
+                    yield sse({
+                        "type": "stage",
+                        "stage": {
+                            "stage_id": "workflow_supervisor:0",
+                            "agent": "workflow_supervisor",
+                            "status": "done",
+                            "parent_stage_id": "orchestrator:0",
+                            "input": query,
+                            "reply": f"{workflow.get('label') or 'Workflow'} completed: {' -> '.join(stages)}",
+                            "truncated": False,
+                        },
+                    })
                     yield sse({"type": "workflow", "workflow": workflow})
                 elif etype == "token":
                     reply_parts.append(event.get("content") or "")

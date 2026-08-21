@@ -10,6 +10,8 @@ cannot recurse indefinitely.
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Iterator
 
+import logging
+
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
@@ -20,7 +22,12 @@ from agents.draft_agent import draft_generate
 from agents.email_agent import email_generate
 from agents.researcher_agent import researcher_generate
 
+logger = logging.getLogger("legal_assist.agents.workflow")
+
 MAX_REFINEMENT_PASSES = 2
+# Per-stage replies are echoed to the UI for flow visibility; cap the payload.
+MAX_STAGE_REPLY_CHARS = 6000
+SUPERVISOR_STAGE = "workflow_supervisor:0"
 
 WORKFLOW_DEFINITIONS = {
     "sequential": {
@@ -109,7 +116,25 @@ def _run(agent_name: str, state: AgentState, config: RunnableConfig, context: st
     """Run each workflow stage through LangGraph before returning its hand-off."""
     graph = build_workflow_stage_graph(agent_name)
     result = graph.invoke(_state_for_subagent(state, context), config=config)
-    return {"agent": agent_name, "reply": (result.get("reply") or "").strip(), "metadata": result.get("agent_metadata") or {}}
+    return {"agent": agent_name, "reply": (result.get("reply") or "").strip(), "metadata": result.get("agent_metadata") or {}, "input": context}
+
+
+def _safe_run(agent_name: str, state: AgentState, config: RunnableConfig, context: str = "") -> dict[str, Any]:
+    """Run a stage without letting one failed LLM call kill the whole workflow."""
+    try:
+        return _run(agent_name, state, config, context)
+    except Exception as exc:  # noqa: BLE001 - keep the workflow alive
+        logger.warning("Workflow stage %s failed: %s", agent_name, exc)
+        return {
+            "agent": agent_name,
+            "reply": (
+                f"⚠️ This stage could not complete ({exc}). "
+                "The workflow continued with the remaining stages."
+            ),
+            "metadata": {"error": str(exc)},
+            "input": context,
+            "failed": True,
+        }
 
 
 def _render(mode: str, results: list[dict[str, Any]]) -> str:
@@ -121,16 +146,40 @@ def _render(mode: str, results: list[dict[str, Any]]) -> str:
     return "\n\n".join(sections)
 
 
-def _stage_event(event_type: str, result: dict[str, Any] | None, agent: str, stage_id: str) -> dict[str, Any]:
-    """Create a UI-visible lifecycle event for one workflow stage."""
+def _stage_event(
+    event_type: str,
+    result: dict[str, Any] | None,
+    agent: str,
+    stage_id: str,
+    parent_stage_id: str = "",
+    input_text: str = "",
+) -> dict[str, Any]:
+    """Create a UI-visible lifecycle event for one workflow stage.
+
+    The events carry the hand-off text (``input``) and the stage reply so the
+    frontend can render the agent tree: which agent received what, and what it
+    passed on to the next agent.
+    """
     if event_type == "agent_start":
-        return {"type": event_type, "agent": agent, "stage_id": stage_id}
+        return {
+            "type": event_type,
+            "agent": agent,
+            "stage_id": stage_id,
+            "parent_stage_id": parent_stage_id,
+            "input": input_text,
+        }
     result = result or {}
+    reply = result.get("reply") or ""
     return {
         "type": "agent_done",
         "agent": agent,
         "stage_id": stage_id,
-        "reply_chars": len(result.get("reply") or ""),
+        "parent_stage_id": parent_stage_id,
+        "input": input_text,
+        "reply": reply[:MAX_STAGE_REPLY_CHARS],
+        "truncated": len(reply) > MAX_STAGE_REPLY_CHARS,
+        "failed": bool(result.get("failed")),
+        "reply_chars": len(reply),
         "agent_metadata": result.get("metadata") or {},
     }
 
@@ -144,23 +193,29 @@ def stream_workflow(state: AgentState, config: RunnableConfig, mode: str) -> Ite
     """
     mode = mode if mode in WORKFLOW_DEFINITIONS else "sequential"
     results: list[dict[str, Any]] = []
+    nodes: list[dict[str, str]] = []
     counter = 0
+    latest_stage = SUPERVISOR_STAGE
 
-    def run_stage(agent: str, context: str) -> Iterator[dict[str, Any]]:
-        nonlocal counter
+    def run_stage(agent: str, context: str, parent: str) -> Iterator[dict[str, Any]]:
+        nonlocal counter, latest_stage
         counter += 1
         stage_id = f"{agent}:{counter}"
-        yield _stage_event("agent_start", None, agent, stage_id)
-        result = _run(agent, state, config, context)
+        nodes.append({"stage_id": stage_id, "agent": agent, "parent_stage_id": parent})
+        yield _stage_event("agent_start", None, agent, stage_id, parent, context)
+        result = _safe_run(agent, state, config, context)
         results.append(result)
-        yield _stage_event("agent_done", result, agent, stage_id)
+        latest_stage = stage_id
+        yield _stage_event("agent_done", result, agent, stage_id, parent, context)
 
     if mode == "sequential":
-        yield from run_stage("researcher", "Research the issue and identify legal considerations for the drafting subagent.")
+        yield from run_stage("researcher", "Research the issue and identify legal considerations for the drafting subagent.", SUPERVISOR_STAGE)
+        research_parent = latest_stage
         research = results[-1]
-        yield from run_stage("draft", f"Use this research hand-off to prepare the requested draft:\n{research['reply']}")
+        yield from run_stage("draft", f"Use this research hand-off to prepare the requested draft:\n{research['reply']}", research_parent)
+        draft_parent = latest_stage
         draft = results[-1]
-        yield from run_stage("assistant", f"Summarise next steps after this draft:\n{draft['reply']}")
+        yield from run_stage("assistant", f"Summarise next steps after this draft:\n{draft['reply']}", draft_parent)
     elif mode in {"parallel", "supervisor"}:
         assigned = WORKFLOW_DEFINITIONS[mode]["agents"]
         contexts = {
@@ -175,48 +230,60 @@ def stream_workflow(state: AgentState, config: RunnableConfig, mode: str) -> Ite
             for agent in assigned:
                 counter += 1
                 stage_ids[agent] = f"{agent}:{counter}"
-                yield _stage_event("agent_start", None, agent, stage_ids[agent])
-                futures[pool.submit(_run, agent, state, config, contexts.get(agent, ""))] = agent
+                nodes.append({"stage_id": stage_ids[agent], "agent": agent, "parent_stage_id": SUPERVISOR_STAGE})
+                yield _stage_event("agent_start", None, agent, stage_ids[agent], SUPERVISOR_STAGE, contexts.get(agent, ""))
+                futures[pool.submit(_safe_run, agent, state, config, contexts.get(agent, ""))] = agent
             completed = {}
             for future in as_completed(futures):
                 agent = futures[future]
                 result = future.result()
                 completed[agent] = result
-                yield _stage_event("agent_done", result, agent, stage_ids[agent])
+                yield _stage_event("agent_done", result, agent, stage_ids[agent], SUPERVISOR_STAGE, contexts.get(agent, ""))
         results.extend(completed[agent] for agent in assigned)
     elif mode == "loop":
-        yield from run_stage("draft", "Create the first complete draft.")
+        yield from run_stage("draft", "Create the first complete draft.", SUPERVISOR_STAGE)
+        draft_parent = latest_stage
         draft = results[-1]
         for pass_number in range(1, MAX_REFINEMENT_PASSES + 1):
-            yield from run_stage("researcher", f"Review this draft for legal gaps and improvements (pass {pass_number}):\n{draft['reply']}")
+            yield from run_stage("researcher", f"Review this draft for legal gaps and improvements (pass {pass_number}):\n{draft['reply']}", draft_parent)
+            review_parent = latest_stage
             review = results[-1]
-            yield from run_stage("draft", f"Revise the draft using this review (pass {pass_number}):\n{review['reply']}")
+            yield from run_stage("draft", f"Revise the draft using this review (pass {pass_number}):\n{review['reply']}", review_parent)
+            draft_parent = latest_stage
             draft = results[-1]
     elif mode == "cycle":
-        yield from run_stage("researcher", "Research the issue before drafting.")
+        yield from run_stage("researcher", "Research the issue before drafting.", SUPERVISOR_STAGE)
+        research_parent = latest_stage
         research = results[-1]
-        yield from run_stage("draft", f"Draft using the research:\n{research['reply']}")
+        yield from run_stage("draft", f"Draft using the research:\n{research['reply']}", research_parent)
+        draft_parent = latest_stage
         draft = results[-1]
-        yield from run_stage("researcher", f"Perform a gap-check on this draft and list only material corrections:\n{draft['reply']}")
+        yield from run_stage("researcher", f"Perform a gap-check on this draft and list only material corrections:\n{draft['reply']}", draft_parent)
+        gap_parent = latest_stage
         gap_check = results[-1]
-        yield from run_stage("draft", f"Produce the final revised draft using the gap-check:\n{gap_check['reply']}")
+        yield from run_stage("draft", f"Produce the final revised draft using the gap-check:\n{gap_check['reply']}", gap_parent)
     else:  # hitl
-        yield from run_stage("researcher", "Research the issue before preparing a human-review draft.")
+        yield from run_stage("researcher", "Research the issue before preparing a human-review draft.", SUPERVISOR_STAGE)
+        research_parent = latest_stage
         research = results[-1]
-        yield from run_stage("draft", f"Create a review-ready draft using this research:\n{research['reply']}")
+        yield from run_stage("draft", f"Create a review-ready draft using this research:\n{research['reply']}", research_parent)
+        draft_parent = latest_stage
         draft = results[-1]
         counter += 1
-        checkpoint = {"agent": "human_review", "reply": "Human approval checkpoint: verify facts, names, dates, amounts, jurisdiction, remedy, and tone. Approve or request changes before using this draft.", "metadata": {"human_in_loop": True}}
+        checkpoint = {"agent": "human_review", "reply": "Human approval checkpoint: verify facts, names, dates, amounts, jurisdiction, remedy, and tone. Approve or request changes before using this draft.", "metadata": {"human_in_loop": True}, "input": draft["reply"]}
         stage_id = f"human_review:{counter}"
-        yield _stage_event("agent_start", None, "human_review", stage_id)
+        nodes.append({"stage_id": stage_id, "agent": "human_review", "parent_stage_id": draft_parent})
+        yield _stage_event("agent_start", None, "human_review", stage_id, draft_parent, draft["reply"])
         results.append(checkpoint)
-        yield _stage_event("agent_done", checkpoint, "human_review", stage_id)
-        yield from run_stage("researcher", f"Perform a legal quality review of this human-review draft and list material corrections:\n{draft['reply']}")
+        latest_stage = stage_id
+        yield _stage_event("agent_done", checkpoint, "human_review", stage_id, draft_parent, draft["reply"])
+        yield from run_stage("researcher", f"Perform a legal quality review of this human-review draft and list material corrections:\n{draft['reply']}", draft_parent)
+        review_parent = latest_stage
         review = results[-1]
-        yield from run_stage("draft", f"Prepare a final draft that incorporates the legal review. It remains subject to the human approval checkpoint:\n{review['reply']}")
+        yield from run_stage("draft", f"Prepare a final draft that incorporates the legal review. It remains subject to the human approval checkpoint:\n{review['reply']}", review_parent)
 
     definition = WORKFLOW_DEFINITIONS[mode]
-    workflow = {"mode": mode, **definition, "stages": [item["agent"] for item in results], "human_in_loop": mode == "hitl"}
+    workflow = {"mode": mode, **definition, "stages": [item["agent"] for item in results], "nodes": nodes, "human_in_loop": mode == "hitl"}
     yield {"type": "workflow", "workflow": workflow}
     yield {"type": "token", "content": _render(mode, results)}
     yield {"type": "done", "agent": "workflow_supervisor"}
@@ -230,11 +297,11 @@ def workflow_generate(state: AgentState, config: RunnableConfig) -> dict[str, An
 
     results: list[dict[str, Any]] = []
     if mode == "sequential":
-        research = _run("researcher", state, config, "Research the issue and identify legal considerations for the drafting subagent.")
+        research = _safe_run("researcher", state, config, "Research the issue and identify legal considerations for the drafting subagent.")
         results.append(research)
-        draft = _run("draft", state, config, f"Use this research hand-off to prepare the requested draft:\n{research['reply']}")
+        draft = _safe_run("draft", state, config, f"Use this research hand-off to prepare the requested draft:\n{research['reply']}")
         results.append(draft)
-        results.append(_run("assistant", state, config, f"Summarise next steps after this draft:\n{draft['reply']}"))
+        results.append(_safe_run("assistant", state, config, f"Summarise next steps after this draft:\n{draft['reply']}"))
     elif mode in {"parallel", "supervisor"}:
         assigned = WORKFLOW_DEFINITIONS[mode]["agents"]
         contexts = {
@@ -247,25 +314,25 @@ def workflow_generate(state: AgentState, config: RunnableConfig) -> dict[str, An
             futures = [pool.submit(_run, agent, state, config, contexts.get(agent, "")) for agent in assigned]
             results = [future.result() for future in futures]
     elif mode == "loop":
-        draft = _run("draft", state, config, "Create the first complete draft.")
+        draft = _safe_run("draft", state, config, "Create the first complete draft.")
         results.append(draft)
         for pass_number in range(1, MAX_REFINEMENT_PASSES + 1):
-            review = _run("researcher", state, config, f"Review this draft for legal gaps and improvements (pass {pass_number}):\n{draft['reply']}")
+            review = _safe_run("researcher", state, config, f"Review this draft for legal gaps and improvements (pass {pass_number}):\n{draft['reply']}")
             results.append(review)
-            draft = _run("draft", state, config, f"Revise the draft using this review (pass {pass_number}):\n{review['reply']}")
+            draft = _safe_run("draft", state, config, f"Revise the draft using this review (pass {pass_number}):\n{review['reply']}")
             results.append(draft)
     elif mode == "cycle":
-        research = _run("researcher", state, config, "Research the issue before drafting.")
+        research = _safe_run("researcher", state, config, "Research the issue before drafting.")
         results.append(research)
-        draft = _run("draft", state, config, f"Draft using the research:\n{research['reply']}")
+        draft = _safe_run("draft", state, config, f"Draft using the research:\n{research['reply']}")
         results.append(draft)
-        gap_check = _run("researcher", state, config, f"Perform a gap-check on this draft and list only material corrections:\n{draft['reply']}")
+        gap_check = _safe_run("researcher", state, config, f"Perform a gap-check on this draft and list only material corrections:\n{draft['reply']}")
         results.append(gap_check)
-        results.append(_run("draft", state, config, f"Produce the final revised draft using the gap-check:\n{gap_check['reply']}"))
+        results.append(_safe_run("draft", state, config, f"Produce the final revised draft using the gap-check:\n{gap_check['reply']}"))
     else:  # hitl
-        research = _run("researcher", state, config, "Research the issue before preparing a human-review draft.")
+        research = _safe_run("researcher", state, config, "Research the issue before preparing a human-review draft.")
         results.append(research)
-        draft = _run("draft", state, config, f"Create a review-ready draft using this research:\n{research['reply']}")
+        draft = _safe_run("draft", state, config, f"Create a review-ready draft using this research:\n{research['reply']}")
         results.append(draft)
         results.append({
             "agent": "human_review",
@@ -276,9 +343,9 @@ def workflow_generate(state: AgentState, config: RunnableConfig) -> dict[str, An
             ),
             "metadata": {"human_in_loop": True},
         })
-        review = _run("researcher", state, config, f"Perform a legal quality review of this human-review draft and list material corrections:\n{draft['reply']}")
+        review = _safe_run("researcher", state, config, f"Perform a legal quality review of this human-review draft and list material corrections:\n{draft['reply']}")
         results.append(review)
-        results.append(_run("draft", state, config, f"Prepare a final draft that incorporates the legal review. It remains subject to the human approval checkpoint:\n{review['reply']}"))
+        results.append(_safe_run("draft", state, config, f"Prepare a final draft that incorporates the legal review. It remains subject to the human approval checkpoint:\n{review['reply']}"))
 
     definition = WORKFLOW_DEFINITIONS[mode]
     return {
