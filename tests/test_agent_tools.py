@@ -8,15 +8,18 @@ import json
 
 from agents.agent_tools import (
     DB_TOOLS,
+    DB_TASK_TOOLS,
     GENERAL_TOOLS,
     LAWYER_TOOLS,
     RESEARCH_TOOLS,
     TEMPLATE_TOOLS,
     define_legal_term,
     get_legal_template,
+    inspect_database_schema,
     list_legal_templates,
     list_lawyers,
     query_lawyer_database,
+    run_database_task,
     search_bare_acts,
 )
 
@@ -27,6 +30,7 @@ def test_tool_sets_are_consistent():
     assert RESEARCH_TOOLS == [define_legal_term, search_bare_acts]
     assert LAWYER_TOOLS == [list_lawyers, query_lawyer_database]
     assert DB_TOOLS == [query_lawyer_database]
+    assert DB_TASK_TOOLS == [run_database_task, inspect_database_schema]
     assert TEMPLATE_TOOLS == [list_legal_templates, get_legal_template]
 
 
@@ -121,3 +125,72 @@ def test_list_lawyers_unreachable_returns_error_json(monkeypatch):
     data = json.loads(list_lawyers.invoke({}))
     assert data["error"]
     assert data["lawyers"] == []
+
+
+# ── DB task tool (mocked DB) — write-policy guardrails ──────────
+def test_run_database_task_blocks_ddl_with_guardrail(monkeypatch):
+    import connectors.neon_postgres as pg
+
+    def _explode(sql, limit=25):  # pragma: no cover — must never be reached
+        raise AssertionError("run_select must not be called for blocked SQL")
+
+    monkeypatch.setattr(pg, "run_select", _explode)
+    monkeypatch.setattr(pg, "run_write", _explode)
+    data = json.loads(run_database_task.invoke({"sql": "DROP TABLE lawyers"}))
+    assert data["error"].startswith("SQL rejected")
+    assert data["guardrails"][0]["name"] == "write_policy"
+    assert data["guardrails"][0]["status"] == "blocked"
+
+
+def test_run_database_task_write_commits_with_guardrails(monkeypatch):
+    import connectors.neon_postgres as pg
+
+    calls = {}
+
+    def _write(sql):
+        calls["sql"] = sql
+        return {"row_count": 1, "columns": ["id"], "rows": [{"id": 42}]}
+
+    monkeypatch.setattr(pg, "run_write", _write)
+    data = json.loads(run_database_task.invoke({"sql": "INSERT INTO lawyers (name) VALUES ('Test') RETURNING id"}))
+    assert data["kind"] == "write"
+    assert data["row_count"] == 1
+    names = [g["name"] for g in data["guardrails"]]
+    assert "write_policy" in names and "transaction" in names and "statement_timeout" in names
+    assert all(g["status"] in ("passed", "enforced") for g in data["guardrails"])
+
+
+def test_run_database_task_select_capped_with_guardrails(monkeypatch):
+    import connectors.neon_postgres as pg
+
+    monkeypatch.setattr(
+        pg, "run_select",
+        lambda sql, limit=25: {"sql": sql, "row_count": 1, "columns": ["n"], "rows": [{"n": 1}]},
+    )
+    data = json.loads(run_database_task.invoke({"sql": "SELECT COUNT(*) AS n FROM lawyers"}))
+    assert data["kind"] == "select"
+    names = [g["name"] for g in data["guardrails"]]
+    assert "row_cap" in names
+
+
+def test_run_database_task_rollback_guardrail_on_db_error(monkeypatch):
+    import connectors.neon_postgres as pg
+
+    def _fail(sql):
+        raise RuntimeError("duplicate key")
+
+    monkeypatch.setattr(pg, "run_write", _fail)
+    data = json.loads(run_database_task.invoke({"sql": "UPDATE lawyers SET name='x' WHERE id=1"}))
+    assert data["error"]
+    tx = [g for g in data["guardrails"] if g["name"] == "transaction"]
+    assert tx and tx[-1]["status"] == "blocked"
+
+
+def test_inspect_database_schema_returns_ddl(monkeypatch):
+    import connectors.neon_postgres as pg
+
+    monkeypatch.setattr(pg, "schema_ddl_text", lambda: "lawyers (id integer, name text)")
+    monkeypatch.setattr(pg, "get_schema", lambda force_refresh=False: {"lawyers": [{"column": "id", "data_type": "integer"}]})
+    data = json.loads(inspect_database_schema.invoke({}))
+    assert "lawyers" in data["ddl"]
+    assert "lawyers" in data["tables"]

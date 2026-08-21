@@ -8,6 +8,7 @@ Architecture:
                    ├──► email
                    ├──► lawyer_finder
                    └──► db_chat
+                   └──► db_task
 
 Each specialist writes its reply into state["reply"].
 The orchestrator's ``decide_route`` is used as a conditional edge.
@@ -27,6 +28,7 @@ from agents.document_creator_agent import document_creator_generate
 from agents.email_agent import email_generate
 from agents.lawyer_finder_agent import lawyer_finder_generate
 from agents.db_chat_agent import db_chat_generate
+from agents.db_task_agent import db_task_generate
 from agents.workflow_agent import detect_workflow, stream_workflow, workflow_generate
 from agents.case_strategy_agent import case_strategy_generate
 from agents.compliance_agent import compliance_generate
@@ -48,6 +50,7 @@ def build_multi_graph(api_key: str, model: str):
     graph.add_node("email", email_generate)
     graph.add_node("lawyer_finder", lawyer_finder_generate)
     graph.add_node("db_chat", db_chat_generate)
+    graph.add_node("db_task", db_task_generate)
     graph.add_node("workflow_supervisor", workflow_generate)
     graph.add_node("case_strategy", case_strategy_generate)
     graph.add_node("compliance", compliance_generate)
@@ -69,6 +72,7 @@ def build_multi_graph(api_key: str, model: str):
             "email": "email",
             "lawyer_finder": "lawyer_finder",
             "db_chat": "db_chat",
+            "db_task": "db_task",
             "workflow_supervisor": "workflow_supervisor",
             "case_strategy": "case_strategy",
             "compliance": "compliance",
@@ -78,7 +82,7 @@ def build_multi_graph(api_key: str, model: str):
     )
 
     # All specialist agents → END
-    for agent_name in ("assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance", "negotiation", "risk_assessment"):
+    for agent_name in ("assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat", "db_task", "workflow_supervisor", "case_strategy", "compliance", "negotiation", "risk_assessment"):
         graph.add_edge(agent_name, END)
 
     return graph.compile()

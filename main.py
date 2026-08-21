@@ -869,14 +869,15 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     specialist_meta = event.get("agent_metadata") or {}
                     detail = f"Reply generated · {event.get('reply_chars') or 0} characters"
                     # Agentic visibility — which tools the agent called
-                    agent_meta = specialist_meta.get(agent) or {}
+                    agent_meta = specialist_meta.get(raw_agent) or specialist_meta.get(agent) or {}
                     tools_used = agent_meta.get("tools_used") or []
                     if tools_used:
                         detail += f" · tools: {', '.join(tools_used)}"
-                    db_info = (specialist_meta.get("db_chat") or {})
+                    db_info = (specialist_meta.get("db_chat") or specialist_meta.get("db_task") or {})
                     if db_info.get("sql"):
+                        verb = "affected" if db_info.get("kind") == "write" else "fetched"
                         detail = (
-                            f"SQL executed · {db_info.get('row_count') or 0} row(s) fetched: "
+                            f"SQL executed · {db_info.get('row_count') or 0} row(s) {verb}: "
                             f"{db_info['sql'][:120]}"
                         )
                         # Surface the executed SQL to the user in the UI
@@ -889,6 +890,12 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                         })
                     elif db_info.get("error"):
                         detail = f"Query failed — {db_info['error'][:80]}"
+                    # Guardrail visibility — stream every guardrail evaluation
+                    for guard in (agent_meta.get("guardrails") or db_info.get("guardrails") or []):
+                        yield sse({
+                            "type": "guardrail",
+                            "guardrail": {"agent": raw_agent, **guard},
+                        })
                     yield step(agent, "done", detail)
                     yield sse({
                         "type": "stage",

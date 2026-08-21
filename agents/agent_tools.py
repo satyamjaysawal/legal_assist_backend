@@ -41,7 +41,13 @@ def query_lawyer_database(sql: str) -> str:
     clean_sql, err = validate_select_sql(sql)
     if not clean_sql:
         logger.info("tool query_lawyer_database rejected SQL (%s): %r", err, (sql or "")[:200])
-        return _json({"error": f"SQL rejected: {err}", "hint": "Send a single read-only SELECT statement."})
+        return _json({
+            "error": f"SQL rejected: {err}",
+            "hint": "Send a single read-only SELECT statement.",
+            "guardrails": [
+                {"name": "sql_read_only", "status": "blocked", "detail": err},
+            ],
+        })
     try:
         result = run_select(clean_sql)
     except Exception as exc:  # noqa: BLE001 — surface DB errors to the model
@@ -54,7 +60,76 @@ def query_lawyer_database(sql: str) -> str:
         "row_count": result["row_count"],
         "columns": result["columns"],
         "rows": result["rows"],
+        "guardrails": [
+            {"name": "sql_read_only", "status": "passed", "detail": "single read-only SELECT accepted"},
+            {"name": "row_cap", "status": "enforced", "detail": "result capped at the configured row limit"},
+            {"name": "statement_timeout", "status": "enforced", "detail": "query runs under a statement timeout"},
+        ],
     })
+
+
+@tool
+def run_database_task(sql: str) -> str:
+    """Execute ONE database statement (SELECT, INSERT, UPDATE or DELETE)
+    against the assistant PostgreSQL database and return the result as
+    JSON. Writes run inside a single committed transaction. DDL and
+    admin statements (DROP/ALTER/TRUNCATE/CREATE/GRANT/…) and multiple
+    statements are blocked by guardrails. Use this for any database
+    task: inspect data, add rows, update or delete records."""
+    from connectors.neon_postgres import run_select, run_write, validate_task_sql  # noqa: PLC0415
+
+    clean_sql, err, kind = validate_task_sql(sql)
+    if not clean_sql:
+        logger.info("tool run_database_task rejected SQL (%s): %r", err, (sql or "")[:200])
+        return _json({
+            "error": f"SQL rejected: {err}",
+            "hint": "Send ONE SELECT/INSERT/UPDATE/DELETE statement; DDL is blocked.",
+            "guardrails": [
+                {"name": "write_policy", "status": "blocked", "detail": err},
+            ],
+        })
+    guards = [
+        {"name": "write_policy", "status": "passed",
+         "detail": "single statement; DDL/admin keywords blocked, SELECT/INSERT/UPDATE/DELETE allowed"},
+    ]
+    try:
+        if kind == "select":
+            result = run_select(clean_sql)
+            guards.append({"name": "row_cap", "status": "enforced", "detail": "result capped at the configured row limit"})
+        else:
+            result = run_write(clean_sql)
+            guards.append({"name": "transaction", "status": "passed", "detail": "write committed atomically (rollback on error)"})
+        guards.append({"name": "statement_timeout", "status": "enforced", "detail": "query runs under a statement timeout"})
+    except Exception as exc:  # noqa: BLE001 — surface DB errors to the model
+        logger.warning("tool run_database_task failed: %s", exc)
+        return _json({
+            "error": f"Database statement failed: {str(exc)[:200]}",
+            "sql": clean_sql,
+            "guardrails": guards + [{"name": "transaction", "status": "blocked", "detail": f"rolled back after error: {str(exc)[:120]}"}],
+        })
+
+    logger.info("tool run_database_task executed %s: %s (%d rows)", kind, clean_sql, result["row_count"])
+    return _json({
+        "sql": clean_sql,
+        "kind": kind,
+        "row_count": result["row_count"],
+        "columns": result["columns"],
+        "rows": result["rows"],
+        "guardrails": guards,
+    })
+
+
+@tool
+def inspect_database_schema() -> str:
+    """Return the current public schema of the assistant PostgreSQL
+    database (tables with column names and types) so you can write
+    correct SQL for any database task."""
+    from connectors.neon_postgres import get_schema, schema_ddl_text  # noqa: PLC0415
+
+    ddl = schema_ddl_text()
+    if not ddl:
+        return _json({"error": "Schema unavailable — database not reachable", "tables": {}})
+    return _json({"tables": get_schema(), "ddl": ddl})
 
 
 @tool
@@ -130,4 +205,5 @@ RESEARCH_TOOLS = [define_legal_term, search_bare_acts]
 GENERAL_TOOLS = [define_legal_term]
 LAWYER_TOOLS = [list_lawyers, query_lawyer_database]
 DB_TOOLS = [query_lawyer_database]
+DB_TASK_TOOLS = [run_database_task, inspect_database_schema]
 TEMPLATE_TOOLS = [list_legal_templates, get_legal_template]

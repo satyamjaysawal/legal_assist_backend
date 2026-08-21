@@ -16,6 +16,7 @@ EXPECTED_AGENTS = {
     "email",
     "lawyer_finder",
     "db_chat",
+    "db_task",
     "workflow_supervisor",
     "case_strategy",
     "compliance",

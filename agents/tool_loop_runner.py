@@ -113,7 +113,7 @@ def _extract_payload(messages: list[Any], tool_name: str) -> dict[str, Any] | No
                 data = json.loads(str(msg.content or ""))
             except (json.JSONDecodeError, TypeError):
                 continue
-            if isinstance(data, dict) and not data.get("error"):
+            if isinstance(data, dict) and (not data.get("error") or data.get("guardrails")):
                 payload = data
     return payload
 

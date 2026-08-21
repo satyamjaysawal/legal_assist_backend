@@ -165,13 +165,16 @@ _FORBIDDEN = re.compile(
     re.IGNORECASE,
 )
 
+# Destructive / admin statements the db_task agent may never run.
+_DDL_FORBIDDEN = re.compile(
+    r"\b(drop|alter|truncate|create|grant|revoke|copy|vacuum|reindex|refresh|call|execute|prepare|discard|lock|comment)\b",
+    re.IGNORECASE,
+)
+
 
 def validate_select_sql(sql: str) -> tuple[str | None, str]:
     """Return (clean_sql, error). clean_sql is None when the SQL is unsafe."""
-    cleaned = (sql or "").strip().rstrip(";").strip()
-    # strip line comments to stop smuggled keywords hiding after '--'
-    cleaned = re.sub(r"--.*?$", "", cleaned, flags=re.MULTILINE).strip()
-    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL).strip()
+    cleaned = _strip_sql(sql)
     if not cleaned:
         return None, "Empty SQL"
     if ";" in cleaned:
@@ -191,6 +194,69 @@ def validate_select_sql(sql: str) -> tuple[str | None, str]:
             flags=re.IGNORECASE,
         )
     return cleaned, ""
+
+
+def _strip_sql(sql: str) -> str:
+    """Trim, drop trailing semicolon and remove comments (shared by validators)."""
+    cleaned = (sql or "").strip().rstrip(";").strip()
+    cleaned = re.sub(r"--.*?$", "", cleaned, flags=re.MULTILINE).strip()
+    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL).strip()
+    return cleaned
+
+
+def validate_task_sql(sql: str) -> tuple[str | None, str, str]:
+    """Validate SQL for the general-purpose db_task agent.
+
+    Returns (clean_sql, error, kind) where kind is one of
+    "select" | "write" | "" (empty when rejected).
+    Allows SELECT/WITH plus INSERT/UPDATE/DELETE; DDL and admin
+    statements stay forbidden and multiple statements are rejected.
+    """
+    cleaned = _strip_sql(sql)
+    if not cleaned:
+        return None, "Empty SQL", ""
+    if ";" in cleaned:
+        return None, "Multiple statements are not allowed", ""
+    if re.match(r"^\s*(select|with)\b", cleaned, re.IGNORECASE):
+        kind = "select"
+    elif re.match(r"^\s*(insert|update|delete)\b", cleaned, re.IGNORECASE):
+        kind = "write"
+    else:
+        return None, "Only SELECT/INSERT/UPDATE/DELETE statements are allowed", ""
+    if _DDL_FORBIDDEN.search(cleaned):
+        return None, "DDL/admin keywords are blocked by the write-policy guardrail", ""
+    if kind == "select":
+        # enforce a row cap on reads
+        if not re.search(r"\blimit\s+\d+", cleaned, re.IGNORECASE):
+            cleaned = f"{cleaned} LIMIT {MAX_ROWS}"
+        else:
+            cleaned = re.sub(
+                r"\blimit\s+(\d+)",
+                lambda m: f"LIMIT {min(int(m.group(1)), MAX_ROWS)}",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+    return cleaned, "", kind
+
+
+def run_write(sql: str) -> dict[str, Any]:
+    """Execute ONE INSERT/UPDATE/DELETE in a transaction and commit.
+
+    Returns {row_count, columns, rows}; rows carry a RETURNING clause
+    result when present.
+    """
+    with get_pg_conn(read_only=False) as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                columns = [d[0] for d in cur.description] if cur.description else []
+                rows = [dict(zip(columns, row)) for row in cur.fetchall()] if columns else []
+                affected = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return {"row_count": affected, "columns": columns, "rows": rows}
 
 
 class NeonPostgresConnector:

@@ -30,7 +30,7 @@ ORCHESTRATOR_PROMPT = """You are the root orchestrator agent for a legal AI assi
 Read the latest user message and return ONLY valid JSON:
 
 {
-  "intent": "question|draft|review|procedure|compare|document|email|find_lawyer|db_query|case_strategy|compliance|negotiation|risk_assessment|other",
+  "intent": "question|draft|review|procedure|compare|document|email|find_lawyer|db_query|db_task|case_strategy|compliance|negotiation|risk_assessment|other",
   "domain": "contract|criminal|civil|family|employment|ip|property|tax|constitutional|general",
   "complexity": "simple|medium|complex",
   "jurisdiction": "country or state if mentioned, else unspecified",
@@ -54,6 +54,10 @@ Routing rules:
   filter/count/rank lawyers by city, experience, fees, rating, reviews,
   e.g. "show lawyers in Mumbai with 10+ years experience", "how many
   criminal lawyers do you have", "cheapest family lawyers in Delhi") → "db_chat"
+- "db_task" (perform a database task beyond read-only lookup: add/insert
+  data, update or delete rows, inspect tables/schema, seed demo data,
+  e.g. "if no data is available then add some data in the table and show
+  me the result", "show me all tables", "insert a test lawyer") → "db_task"
 - "case_strategy" (plan a dispute, prepare evidence, evaluate options, map
   next litigation steps) → "case_strategy"
 - "compliance" (assess a policy, process, business, or document for
@@ -77,6 +81,7 @@ INTENT_AGENT_MAP: dict[str, str] = {
     "email": "email",
     "find_lawyer": "lawyer_finder",
     "db_query": "db_chat",
+    "db_task": "db_task",
     "case_strategy": "case_strategy",
     "compliance": "compliance",
     "negotiation": "negotiation",
@@ -177,7 +182,7 @@ def decide_route(state: AgentState) -> str:
     """Conditional-edge function used by LangGraph to pick the next node."""
     route = (state.get("routed_to") or "assistant").strip()
     # validate against known agents
-    valid = {"assistant", "researcher", "draft", "document_creator", "email", "lawyer_finder", "db_chat", "workflow_supervisor", "case_strategy", "compliance", "negotiation", "risk_assessment"}
+    valid = set(INTENT_AGENT_MAP.values())
     return route if route in valid else "assistant"
 
 

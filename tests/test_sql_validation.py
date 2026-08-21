@@ -5,7 +5,7 @@ Written as unittest.TestCase classes (executed by pytest).
 
 import unittest
 
-from connectors.neon_postgres import MAX_ROWS, validate_select_sql
+from connectors.neon_postgres import MAX_ROWS, validate_select_sql, validate_task_sql
 
 
 class TestValidateSelectSqlAccepts(unittest.TestCase):
@@ -81,6 +81,50 @@ class TestValidateSelectSqlRejects(unittest.TestCase):
 
     def test_forbidden_keyword_inside_select_rejected(self):
         clean, _ = validate_select_sql("SELECT * FROM lawyers; DROP TABLE x")
+        self.assertIsNone(clean)
+
+
+class TestValidateTaskSql(unittest.TestCase):
+    """The db_task write-policy guardrail."""
+
+    def test_select_allowed_and_capped(self):
+        clean, err, kind = validate_task_sql("SELECT * FROM lawyers")
+        self.assertEqual(err, "")
+        self.assertEqual(kind, "select")
+        self.assertIn(f"LIMIT {MAX_ROWS}", clean)
+
+    def test_insert_update_delete_allowed(self):
+        for stmt, kind in (
+            ("INSERT INTO lawyers (name) VALUES ('Test')", "write"),
+            ("UPDATE lawyers SET name='x' WHERE id=1", "write"),
+            ("DELETE FROM lawyers WHERE id=999", "write"),
+        ):
+            clean, err, got = validate_task_sql(stmt)
+            self.assertIsNotNone(clean, f"Should allow: {stmt}")
+            self.assertEqual(err, "")
+            self.assertEqual(got, kind)
+
+    def test_ddl_and_admin_blocked(self):
+        for stmt in (
+            "DROP TABLE lawyers",
+            "TRUNCATE lawyers",
+            "ALTER TABLE lawyers ADD COLUMN x TEXT",
+            "CREATE TABLE evil (id INT)",
+            "GRANT ALL ON lawyers TO public",
+        ):
+            clean, err, kind = validate_task_sql(stmt)
+            self.assertIsNone(clean, f"Should block: {stmt}")
+            self.assertEqual(kind, "")
+            self.assertTrue(err)
+
+    def test_multiple_statements_blocked(self):
+        clean, err, _ = validate_task_sql("DELETE FROM lawyers; DROP TABLE lawyers")
+        self.assertIsNone(clean)
+        self.assertIn("Multiple statements", err)
+
+    def test_ddl_smuggled_inside_write_blocked(self):
+        clean, _, _ = validate_task_sql("UPDATE lawyers SET name='drop table x' WHERE id=1")
+        # keyword inside a string literal is still caught by the guardrail
         self.assertIsNone(clean)
 
 
