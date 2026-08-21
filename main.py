@@ -82,23 +82,21 @@ logger = logging.getLogger("legal_assist.api")
 
 app = FastAPI(title="Legal AI Assistant")
 
-extra_origins = [
-    origin.strip()
-    for origin in os.getenv("CORS_ORIGINS", "").split(",")
-    if origin.strip()
+FRONTEND_ORIGIN = "https://legal-assist-agentic.vercel.app"
+LOCAL_FRONTEND_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        *extra_origins,
+        FRONTEND_ORIGIN,
+        *LOCAL_FRONTEND_ORIGINS,
     ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 

@@ -11,6 +11,29 @@ def test_health_endpoint(client):
     assert {"orchestrator", "assistant", "researcher", "db_chat"}.issubset(agent_names)
 
 
+def test_cors_allows_only_the_canonical_production_frontend(client):
+    allowed_origin = "https://legal-assist-agentic.vercel.app"
+    allowed = client.options(
+        "/health",
+        headers={
+            "Origin": allowed_origin,
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    blocked = client.options(
+        "/health",
+        headers={
+            "Origin": "https://untrusted-preview.vercel.app",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == allowed_origin
+    assert blocked.status_code == 400
+    assert "access-control-allow-origin" not in blocked.headers
+
+
 def test_connectors_endpoint(client):
     resp = client.get("/connectors")
     assert resp.status_code == 200

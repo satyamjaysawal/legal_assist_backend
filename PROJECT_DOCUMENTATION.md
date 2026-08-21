@@ -333,7 +333,10 @@ vercel --prod --yes
 vercel alias set <deployment-url> legal-assist-api.vercel.app
 ```
 
-The frontend reads `VITE_API_URL` (set in Vercel project settings) at build time.
+Production frontend builds are pinned to `https://legal-assist-api.vercel.app`.
+The API accepts browser requests from the canonical frontend origin only:
+`https://legal-assist-agentic.vercel.app`. Local Vite origins remain available
+for development; Vercel preview URLs are not supported.
 
 ---
 

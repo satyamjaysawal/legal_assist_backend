@@ -115,7 +115,11 @@ Copy `.env.example` → `.env` for local development. **Never commit real secret
 | `SEMANTIC_CACHE_ENABLED` | Semantic cache kill-switch (`false` = off, default) |
 | `LOG_LEVEL` | Logging level (default `INFO`) |
 | `SMTP_*` | Outbound email for the email agent |
-| `CORS_ORIGINS` | Extra allowed origins (comma-separated) |
+
+The API accepts browser requests only from the canonical production frontend
+`https://legal-assist-agentic.vercel.app`, plus the two local Vite development
+origins (`http://localhost:5173` and `http://127.0.0.1:5173`). Vercel preview
+URLs are deliberately not allowed.
 
 ## Local setup
 
@@ -200,7 +204,7 @@ vercel alias set <deployment-url> legal-assist-api.vercel.app
 | Issue | Fix |
 | --- | --- |
 | `GROQ_API_KEY is not configured` | Set `.env` or Vercel env `GROQ_API_KEY` |
-| CORS blocked from frontend | Origin must be localhost Vite or `*.vercel.app`, or add it to `CORS_ORIGINS` |
+| CORS blocked from frontend | Use `https://legal-assist-agentic.vercel.app`, or one of the documented local Vite origins |
 | Empty reply / 429 | Groq free-tier daily token quota — fallback chain kicks in automatically |
 | `Neon Postgres not configured` | Set `NEON_POSTGRE_DB` (read lazily, safe with load_dotenv ordering) |
 | Cached error replaying | Error replies are never cached; purge `legal_assist:pcache:<sha>` in Redis if needed |
