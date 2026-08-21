@@ -12,7 +12,7 @@ FastAPI chat API powering a **multi-agent legal AI assistant**: LangGraph orches
 
 | Service | URL |
 | --- | --- |
-| **Frontend app** | https://legal-assist-compact.vercel.app |
+| **Frontend app** | https://legal-assist-agentic.vercel.app |
 | **Backend API** | https://legal-assist-api.vercel.app |
 | **Health** | https://legal-assist-api.vercel.app/health |
 | **Swagger docs** | https://legal-assist-api.vercel.app/docs |

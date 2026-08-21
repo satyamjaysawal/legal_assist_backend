@@ -6,7 +6,7 @@ Everything this project does, how it's built, and what's implemented — feature
 
 | Item | URL |
 | --- | --- |
-| **Live app (frontend)** | https://legal-assist-compact.vercel.app |
+| **Live app (frontend)** | https://legal-assist-agentic.vercel.app |
 | **Backend API** | https://legal-assist-api.vercel.app |
 | **API health** | https://legal-assist-api.vercel.app/health |
 | **Swagger docs** | https://legal-assist-api.vercel.app/docs |
@@ -165,7 +165,7 @@ Flow: user clicks **💬 Lawyer Chat** (header) or **💬 Live Chat with Lawyer*
 
 ## 8. Frontend features
 
-React + Vite + **Tailwind CSS only** (`src/App.jsx`), deployed at https://legal-assist-compact.vercel.app.
+React + Vite + **Tailwind CSS only** (`src/App.jsx`), deployed at https://legal-assist-agentic.vercel.app.
 
 - **Agent Pipeline panel** — live step-by-step visualization: memory reads/writes, exact & semantic cache, RAG, orchestrator routing, specialist work, follow-ups, cache/memory saves
 - **Intent classification chips** — intent · domain · complexity · route
@@ -238,7 +238,7 @@ Both apps are deployed on **Vercel** under [satyam-jaysawals-projects](https://v
 | App | Vercel project | Production alias |
 | --- | --- | --- |
 | Backend | `legal-assist-api` | https://legal-assist-api.vercel.app |
-| Frontend | `legal-assist` | https://legal-assist-compact.vercel.app |
+| Frontend | `legal-assist` | https://legal-assist-agentic.vercel.app |
 
 Workflow (run from each app directory):
 
@@ -255,7 +255,7 @@ The frontend reads `VITE_API_URL` (set in Vercel project settings) at build time
 
 ## 13. Try it
 
-Log in at https://legal-assist-compact.vercel.app and try:
+Log in at https://legal-assist-agentic.vercel.app and try:
 
 - *"What are my rights as a tenant in India?"* — assistant + memory + pipeline view
 - *"Show lawyers in Mumbai with 10+ years experience"* — lawyer_finder + 💬 Live Chat button
