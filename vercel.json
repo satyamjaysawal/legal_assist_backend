@@ -6,16 +6,8 @@
       "use": "@vercel/python",
       "config": {
         "includeFiles": [
-          "graph.py",
-          "memory.py",
-          "auth.py",
-          "journeys.py",
-          "cache.py",
-          "embeddings.py",
-          "docs.py",
-          "vectordb.py",
-          "files.py",
-          "multi_graph.py",
+          "core/**/*.py",
+          "services/**/*.py",
           "agents/**/*.py",
           "connectors/**/*.py",
           "websocket/**/*.py"

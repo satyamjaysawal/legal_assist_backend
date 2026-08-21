@@ -1,8 +1,10 @@
 """Legal dictionary / glossary connector (dummy)."""
 
+import logging
 from typing import Any
 from connectors.base import ConnectorStatus, register_connector
 
+logger = logging.getLogger("legal_assist.connectors.legal_dictionary")
 NAME = "legal_dictionary"
 
 
@@ -46,6 +48,7 @@ class LegalDictionaryConnector:
         return {"connector": NAME, "available": True, "term": term, "definition": None, "suggestions": []}
 
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
+        logger.debug("search(term=%r)", query)
         key = query.strip().lower()
         matches = [(k, v) for k, v in self._GLOSSARY.items() if key in k or key in v.lower()]
         return {

@@ -1,35 +1,49 @@
-"""Lawyer Finder Agent — connect users with lawyers (dummy).
+"""Lawyer Finder Agent — connect users with lawyers (agentic).
 
 Searches for lawyers based on domain, jurisdiction, and specialisation.
-Currently returns dummy data.  When a real lawyer directory is available,
-replace the search logic.
+The live directory comes from Neon Postgres; when unreachable, dummy
+data is injected instead.
+
+Agentic pattern: list_lawyers and query_lawyer_database tools are bound
+to the LLM — it decides whether to browse the full directory or run a
+filtered SQL query for the user's needs.
 
 Sub-agent: Lawyer Connect (WebSocket) is handled separately in
 websocket/lawyer_connect.py for real-time chat between user and lawyer.
 """
 
 import json
+import logging
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
+from agents.tool_loop_runner import run_agent_with_tools
 from agents.base import (
     AgentState,
     invoke_text,
-    latest_user_text,
     register_agent,
     to_lc_messages,
 )
+from agents.agent_tools import LAWYER_TOOLS
+
+logger = logging.getLogger("legal_assist.agents.lawyer_finder")
 
 _llm_cache: dict[str, Any] = {}
 
 LAWYER_FINDER_SYSTEM = """You are the Lawyer Finder agent of a legal AI system.
 You help users find suitable lawyers based on their legal needs.
 
+Tools (use them to get real data before answering):
+- list_lawyers: browse the full lawyer directory.
+- query_lawyer_database: run a read-only SELECT to filter/rank lawyers
+  (by city, specialisation, experience, fees, rating…).
+Call the appropriate tool first, then present the fetched lawyers.
+
 Guidelines:
 - Understand the user's legal domain and jurisdiction.
 - Suggest the type of lawyer they need (criminal, civil, family, etc.).
-- Present the available lawyer listings from the directory data provided.
+- Present the fetched lawyer listings in a clean Markdown table.
 - To start a live conversation, tell the user to click the
   "💬 Live Chat with Lawyer" button shown below your reply — it opens a
   real-time WebSocket chat room with the selected lawyer.
@@ -98,7 +112,8 @@ def _get_dummy_lawyers(domain: str, jurisdiction: str) -> list[dict[str, str]]:
     ]
 
 
-def _get_llm(api_key: str, model: str):
+def _get_demo_llm(config, model):
+    api_key = config.get("configurable", {}).get("api_key", "")
     cache_key = f"lfw:{model}"
     if cache_key not in _llm_cache:
         from agents.base import get_llm
@@ -107,27 +122,29 @@ def _get_llm(api_key: str, model: str):
 
 
 def lawyer_finder_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """Find and present lawyer options to the user."""
-    api_key = config.get("configurable", {}).get("api_key", "")
+    """Find and present lawyer options to the user (agentic tool loop)."""
+    logger.info("lawyer_finder_generate invoked (tools=%s)", [t.name for t in LAWYER_TOOLS])
     model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
 
     analysis = state.get("analysis") or {}
     domain = analysis.get("domain", "general")
     jurisdiction = analysis.get("jurisdiction", "unspecified")
 
-    # Prefer the live Neon directory; fall back to demo listings
+    # Prefer the live Neon directory; fall back to demo listings.
+    # When the live directory is reachable the agent fetches it itself
+    # through its bound tools; the dummy data path keeps injection.
     lawyers = _get_directory_lawyers()
     directory_live = bool(lawyers)
-    if not lawyers:
-        lawyers = _get_dummy_lawyers(domain, jurisdiction)
 
     system = LAWYER_FINDER_SYSTEM
+    if not directory_live:
+        lawyers = _get_dummy_lawyers(domain, jurisdiction)
+        system += (
+            "\n\nDirectory database is unreachable — use these demo listings:\n"
+            + json.dumps(lawyers, indent=2, ensure_ascii=False)
+        )
     system += (
-        f"\n\nAvailable lawyers ({'live directory' if directory_live else 'demo data'}):\n"
-        + json.dumps(lawyers, indent=2, ensure_ascii=False)
-    )
-    system += (
-        "\n\nPresent these lawyers to the user in a clean Markdown table. "
+        "\n\nPresent the lawyers to the user in a clean Markdown table. "
         "End your reply by telling the user to click the '💬 Live Chat with "
         "Lawyer' button below this answer to open a real-time chat room "
         "with any lawyer who has 'available_for_chat: true'."
@@ -156,15 +173,35 @@ def lawyer_finder_generate(state: AgentState, config: RunnableConfig) -> dict[st
             f"- summary: {analysis.get('summary', '')}"
         )
 
-    llm = _get_llm(api_key, model)
-    reply = invoke_text(llm, to_lc_messages(state.get("messages") or [], system), config)
+    if directory_live:
+        # Agentic path — the model fetches directory data via tools
+        result = run_agent_with_tools(
+            system,
+            state.get("messages") or [],
+            LAWYER_TOOLS,
+            config,
+            temperature=0.4,
+        )
+        reply = result["reply"]
+        used_model = result["model"]
+        tools_used = [t["tool"] for t in result["tool_trace"]]
+        agentic = result["agentic"]
+    else:
+        # No database → plain generation over the injected demo data
+        llm = _get_demo_llm(config, model)
+        reply = invoke_text(llm, to_lc_messages(state.get("messages") or [], system), config)
+        used_model = model
+        tools_used = []
+        agentic = False
 
     return {
         "reply": reply,
         "active_agent": "lawyer_finder",
         "agent_metadata": {
             "lawyer_finder": {
-                "model": model,
+                "model": used_model,
+                "agentic": agentic,
+                "tools_used": tools_used,
                 "lawyers_found": len(lawyers),
                 "domain": domain,
                 "jurisdiction": jurisdiction,

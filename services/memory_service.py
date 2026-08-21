@@ -278,6 +278,7 @@ def list_user_facts(user_id: str, limit: int = 40) -> list[dict[str, Any]]:
 
 def merge_history(*histories: list[dict[str, str]]) -> list[dict[str, str]]:
     longest: list[dict[str, str]] = []
+    incoming: list[dict[str, str]] = histories[-1] if histories else []
     for hist in histories:
         cleaned = [
             {"role": m.get("role", "user"), "content": (m.get("content") or "").strip()}
@@ -286,7 +287,21 @@ def merge_history(*histories: list[dict[str, str]]) -> list[dict[str, str]]:
         ]
         if len(cleaned) > len(longest):
             longest = cleaned
-    return longest
+    # The incoming (current request) messages may not be stored in the memory
+    # layers yet — append any that are missing so the latest question is never
+    # dropped when a stored thread is longer than the request payload.
+    # Membership check keeps full-history requests (frontend sends the whole
+    # conversation) from duplicating messages.
+    merged = list(longest)
+    for msg in incoming:
+        role = msg.get("role", "user")
+        content = (msg.get("content") or "").strip()
+        if not content or role not in {"user", "assistant"}:
+            continue
+        item = {"role": role, "content": content}
+        if item not in merged:
+            merged.append(item)
+    return merged
 
 
 def load_thread(user_id: str, journey_id: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
@@ -302,7 +317,7 @@ def load_thread(user_id: str, journey_id: str) -> tuple[list[dict[str, str]], di
         "detail": "No saved thread",
     }
     try:
-        from journeys import load_journey_messages
+        from services.journey_service import load_journey_messages
 
         turns = load_journey_messages(user_id, journey_id)
         report["used"] = bool(turns)
@@ -504,7 +519,7 @@ def save_thread(user_id: str, journey_id: str, messages: list[dict[str, str]], q
         "detail": "Thread write skipped",
     }
     try:
-        from journeys import save_journey_thread
+        from services.journey_service import save_journey_thread
 
         saved = save_journey_thread(user_id, journey_id, messages, title_hint=query)
         report["wrote"] = bool(saved.get("wrote"))
@@ -798,7 +813,7 @@ def save_semantic_fact(user_id: str, text: str, domain: str, journey_id: str) ->
     if not user_id or not text or len(text.strip()) < 5:
         return None
     try:
-        from embeddings import embed_texts
+        from services.embedding_service import embed_texts
         vectors, _ = embed_texts([text], kind="document")
     except Exception as exc:
         return {"name": "semantic", "label": "Semantic", "store": "qdrant", "wrote": False, "detail": f"Embed failed: {exc}"}
@@ -852,7 +867,7 @@ def load_semantic_facts(user_id: str, query: str, limit: int = 5) -> tuple[list[
         report["detail"] = err
         return [], report
     try:
-        from embeddings import embed_texts
+        from services.embedding_service import embed_texts
         from qdrant_client.models import FieldCondition, Filter, MatchValue
         vectors, _ = embed_texts([query], kind="query")
         qfilter = Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])

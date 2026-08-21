@@ -19,14 +19,14 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from agents.base import AgentState
-from agents.orchestrator import analyse_and_route, decide_route
-from agents.assistant import assistant_generate
-from agents.researcher import researcher_generate
-from agents.draft import draft_generate
-from agents.document_creator import document_creator_generate
+from agents.orchestrator_agent import analyse_and_route, decide_route
+from agents.assistant_agent import assistant_generate
+from agents.researcher_agent import researcher_generate
+from agents.draft_agent import draft_generate
+from agents.document_creator_agent import document_creator_generate
 from agents.email_agent import email_generate
-from agents.lawyer_finder import lawyer_finder_generate
-from agents.db_chat import db_chat_generate
+from agents.lawyer_finder_agent import lawyer_finder_generate
+from agents.db_chat_agent import db_chat_generate
 
 
 def build_multi_graph(api_key: str, model: str):

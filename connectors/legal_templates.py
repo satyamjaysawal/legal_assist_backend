@@ -1,8 +1,10 @@
 """Legal document templates connector (dummy)."""
 
+import logging
 from typing import Any
 from connectors.base import ConnectorStatus, register_connector
 
+logger = logging.getLogger("legal_assist.connectors.legal_templates")
 NAME = "legal_templates"
 
 
@@ -61,6 +63,7 @@ class LegalTemplatesConnector:
         }
 
     def get_template(self, template_id: str) -> dict[str, Any]:
+        logger.debug("get_template(id=%r)", template_id)
         tpl = self._DUMMY_TEMPLATES.get(template_id)
         if not tpl:
             return {"connector": NAME, "available": False, "error": f"Template '{template_id}' not found"}

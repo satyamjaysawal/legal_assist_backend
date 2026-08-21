@@ -35,15 +35,19 @@ FastAPI (main.py)
    ├─ Prompt cache check (exact → semantic) → personal-query bypass
    ├─ RAG retrieval (Qdrant) over uploaded documents
    ▼
-LangGraph multi-agent graph (multi_graph.py)
+LangGraph multi-agent graph (agents/multi_agent_graph.py)
    Orchestrator (root agent: intent · domain · complexity)
-   ├─ assistant        — general legal Q&A
-   ├─ researcher       — deep research / review / compare
-   ├─ draft            — legal drafting
-   ├─ document_creator — structured documents
-   ├─ email            — email composition
-   ├─ lawyer_finder    — lawyer directory + live chat
-   └─ db_chat          — text-to-SQL on Neon Postgres
+   ├─ assistant        — general legal Q&A           [tools: define_legal_term]
+   ├─ researcher       — deep research / review      [tools: define_legal_term, search_bare_acts]
+   ├─ draft            — legal drafting              [tools: list_legal_templates, get_legal_template]
+   ├─ document_creator — structured documents        [tools: list_legal_templates, get_legal_template]
+   ├─ email            — email composition           [deterministic]
+   ├─ lawyer_finder    — lawyer directory + live chat[tools: list_lawyers, query_lawyer_database]
+   └─ db_chat          — text-to-SQL on Neon Postgres[tools: query_lawyer_database]
+
+   Every specialist runs an AGENTIC TOOL LOOP (LangChain bind_tools +
+   LangGraph agent⇄ToolNode) — the LLM decides when to call which tool
+   with which arguments (see §3.9 for the reusable pattern).
    ▼
 Reply streamed token-by-token
    ├─ Follow-up generator
@@ -58,49 +62,129 @@ Reply streamed token-by-token
 ## 3. Implemented agents
 
 All agents are registered in a central registry and discovered by the orchestrator. Source: `agents/`.
+Every specialist except `email` is **agentic** — its LLM has LangChain
+tools bound via `bind_tools` and calls them on demand inside a LangGraph
+tool loop (`agents/tool_loop_runner.py` → `run_agent_with_tools`).
 
-### 3.1 Orchestrator (`orchestrator.py`) — Root agent
+### 3.1 Orchestrator (`orchestrator_agent.py`) — Root agent
 - Classifies every query: **intent**, **domain**, **complexity**, **jurisdiction**, on-topic check.
 - Produces a refined query and picks the specialist (`route_to`).
 - Intents: `question`, `procedure`, `review`, `compare`, `draft`, `document`, `email`, `find_lawyer`, `db_query`, `other`.
 
-### 3.2 Assistant (`assistant.py`)
+### 3.2 Assistant (`assistant_agent.py`)
 - Handles `question`, `procedure`, `other`.
 - General legal Q&A, step-by-step procedures, rights and remedies — personalized with user profile and memory.
+- **Tools bound:** `define_legal_term` (looks up a term's exact meaning before explaining it).
 
-### 3.3 Researcher (`researcher.py`)
+### 3.3 Researcher (`researcher_agent.py`)
 - Handles `review`, `compare`.
 - Deep legal research: document review, statute/case-law comparisons, structured findings.
+- **Tools bound:** `define_legal_term`, `search_bare_acts` (fetches statute text before citing it).
 
-### 3.4 Draft (`draft.py`)
+### 3.4 Draft (`draft_agent.py`)
 - Handles `draft`.
 - Legal notices, agreements, letters, petitions. Replies support **PDF / DOCX / TXT export** and the HITL field-filling wizard.
+- **Tools bound:** `list_legal_templates`, `get_legal_template` (fetches the matching template structure first).
 
-### 3.5 Document Creator (`document_creator.py`)
+### 3.5 Document Creator (`document_creator_agent.py`)
 - Handles `document`.
 - Structured documents: RTI applications, complaints, agreements, formal notices.
+- **Tools bound:** `list_legal_templates`, `get_legal_template`.
 
 ### 3.6 Email (`email_agent.py`)
 - Handles `email`.
 - Professional legal emails (client communication, notices, follow-ups); can be sent via SMTP or exported.
+- Deterministic (no external data needed) — plain LLM generation.
 
-### 3.7 Lawyer Finder (`lawyer_finder.py`)
+### 3.7 Lawyer Finder (`lawyer_finder_agent.py`)
 - Handles `find_lawyer`.
 - Pulls the **live lawyer directory from Neon Postgres** (14 seeded profiles with experience, fees, ratings, reviews) with a demo-listing fallback.
 - Presents lawyers in a Markdown table and points users to the **💬 Live Chat with Lawyer** button.
+- **Tools bound:** `list_lawyers`, `query_lawyer_database` — the model decides whether to browse the whole directory or run a filtered SQL query.
 
-### 3.8 DB Chat (`db_chat.py`) — Text-to-SQL
+### 3.8 DB Chat (`db_chat_agent.py`) — Text-to-SQL
 - Handles `db_query` (e.g. *"cheapest family lawyer in Delhi"*, *"average fees in Mumbai"*).
-- Pipeline: schema introspection → LLM generates SQL (JSON / fence / bare-SELECT parsing) → **safety validation** → read-only execution → LLM formats rows into a Markdown answer.
+- **Agentic flow:** the LLM reads the schema, writes a SELECT and calls the `query_lawyer_database` tool itself → the tool validates + executes on Neon → rows return as a ToolMessage → the LLM formats a Markdown answer. If the model never calls the tool (or tool-calling is unavailable), it degrades to the classic deterministic pipeline (LLM writes SQL → validate → execute → format).
 - Safety layers: SELECT/WITH only, forbidden-keyword rejection, comment stripping, single statement, `LIMIT ≤ 25`, `READ ONLY` transaction, 10s statement timeout.
-- The **executed SQL is sent to the UI** as a dedicated `sql` SSE event and rendered in a code card.
+- The **executed SQL is sent to the UI** as a dedicated `sql` SSE event and rendered in a code card (same contract in both paths — the agent lifts the SQL from the tool's ToolMessage payload).
 - Error replies are flagged `cache_error` so failures are **never cached**.
+
+### 3.9 The Agentic Tool-Binding Pattern — how to add any new use case
+
+This is the canonical pattern of the project. Follow these steps for
+every new feature so it plugs into the pipeline identically.
+
+**The loop** (implemented once in `agents/tool_loop_runner.py`):
+
+```
+StateGraph(ToolLoopState)
+  START ─► agent (LLM with bind_tools)
+              │
+              ├─ has tool_calls? ─► tools (ToolNode executes @tool fns)
+              │                          │
+              │◄─────────────────────────┘  (results fed back as ToolMessage)
+              └─ no tool_calls ─► END  (final text reply)
+```
+
+**Step-by-step recipe:**
+
+1. **Connector** — build the capability in `connectors/<name>.py` and
+   `register_connector(...)` it (shows up in `/connectors` UI panel).
+2. **Tool wrapper** — in `agents/agent_tools.py` add an `@tool` function that
+   calls the connector. Rules:
+   - Return a **compact JSON string** (models read tool output as text).
+   - Keep docstrings descriptive — they become the tool description the
+     LLM sees when deciding whether to call it.
+   - If the result must appear in the UI pipeline (like executed SQL),
+     include it in the returned JSON — the agent reads it back from
+     `run_agent_with_tools()["tool_payloads"][tool_name]` (never use
+     globals/thread-locals: ToolNode executes tools on worker threads).
+   - Add the tool to the relevant tool-set list
+     (`RESEARCH_TOOLS`, `LAWYER_TOOLS`, `DB_TOOLS`, `TEMPLATE_TOOLS`…).
+3. **Agent** — create `agents/<name>.py`:
+   ```python
+   from agents.tool_loop_runner import run_agent_with_tools
+   from agents.base import AgentState, register_agent
+   from agents.agent_tools import MY_TOOLS
+
+   def my_agent_generate(state: AgentState, config) -> dict:
+       system = MY_SYSTEM_PROMPT  # + inject analysis/profile/memory/RAG from state
+       result = run_agent_with_tools(system, state["messages"], MY_TOOLS, config)
+       return {
+           "reply": result["reply"],
+           "active_agent": "my_agent",
+           "agent_metadata": {"my_agent": {
+               "model": result["model"],
+               "agentic": result["agentic"],
+               "tools_used": [t["tool"] for t in result["tool_trace"]],
+           }},
+       }
+
+   register_agent("my_agent", description="…", handles=["my_intent"])
+   ```
+   Tell the model in the system prompt WHEN to use each tool; it decides
+   the arguments itself.
+4. **Wire into the graph** — in `agents/multi_agent_graph.py`: `add_node`, add it to
+   the orchestrator's conditional-edge map and to the END-edge loop. In
+   `agents/orchestrator_agent.py`: add the intent to `ORCHESTRATOR_PROMPT`
+   routing rules and to `INTENT_AGENT_MAP`.
+5. **UI surfacing (optional)** — `main.py` already forwards
+   `agent_metadata`; add an SSE branch if the feature needs its own
+   card (see the `sql` event for `db_chat`).
+
+**Robustness guarantees built into `run_agent_with_tools`:**
+- 429/rate-limit → automatic retry through `FALLBACK_MODELS` chain.
+- Model without tool-calling support → graceful degradation to plain
+  `invoke_text` generation (user still gets an answer).
+- Tool exceptions inside the loop → returned to the model as error
+  messages (`handle_tool_errors=True`), never crash the graph.
+- Loop capped at `MAX_TOOL_ITERATIONS` round-trips (`recursion_limit`).
 
 ---
 
 ## 4. Memory system (7 layers + profile)
 
-Source: `memory.py`. Every turn loads all layers into the prompt and writes back after the reply.
+Source: `services/memory_service.py`. Every turn loads all layers into the prompt and writes back after the reply.
 
 | Layer | Store | Purpose |
 | --- | --- | --- |
@@ -120,7 +204,7 @@ Source: `memory.py`. Every turn loads all layers into the prompt and writes back
 
 ## 5. Caching system
 
-Source: `cache.py`.
+Source: `services/cache_service.py`.
 
 | Tier | Key | Store | TTL | Status |
 | --- | --- | --- | --- | --- |
@@ -149,7 +233,7 @@ At query time the top hits are retrieved and injected into the agent prompt; the
 
 ### 7.1 Neon Postgres directory
 - Tables: `lawyers` (14 seeded profiles: specialisation, city, experience, bar ID, fees, rating, reviews, languages, profile) and `lawyer_reviews` (29 seeded reviews).
-- Seed script: `python seed_neon.py` (`--force` to truncate and reseed).
+- Seed script: `python scripts/seed_lawyer_directory.py` (`--force` to truncate and reseed).
 - Served to the UI via `GET /lawyers`.
 
 ### 7.2 Lawyer Connect (WebSocket)

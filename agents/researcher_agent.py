@@ -1,25 +1,34 @@
-"""Researcher Agent — deep legal research.
+"""Researcher Agent — deep legal research (agentic).
 
 Handles queries that need case law analysis, statute lookup, document
 review, or comparison between legal provisions.
+
+Agentic pattern: bare-acts and legal-dictionary tools are bound to the
+LLM, which calls them on demand during its research loop.
 """
 
+import logging
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
+from agents.tool_loop_runner import run_agent_with_tools
 from agents.base import (
     AgentState,
-    invoke_text,
-    latest_user_text,
     register_agent,
-    to_lc_messages,
 )
+from agents.agent_tools import RESEARCH_TOOLS
 
-_llm_cache: dict[str, Any] = {}
+logger = logging.getLogger("legal_assist.agents.researcher")
 
 RESEARCHER_SYSTEM = """You are the Researcher agent of a legal AI system.
 You specialise in deep legal research, case law analysis, and statute interpretation.
+
+Tools: you have research tools bound to you — use them proactively:
+- search_bare_acts: fetch the text of a statute/section you plan to cite.
+- define_legal_term: get the precise definition of a legal term.
+Call the tools BEFORE writing your analysis so your citations are grounded
+in the returned data. If a tool returns dummy/placeholder data, say so.
 
 Guidelines:
 - Analyse the legal question thoroughly.
@@ -32,19 +41,9 @@ Guidelines:
 - Mention this is not formal legal advice."""
 
 
-def _get_llm(api_key: str, model: str):
-    cache_key = f"rsrch:{model}"
-    if cache_key not in _llm_cache:
-        from agents.base import get_llm
-        _llm_cache[cache_key] = get_llm(api_key, model, temperature=0.3)
-    return _llm_cache[cache_key]
-
-
 def researcher_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """Generate a deep research response."""
-    api_key = config.get("configurable", {}).get("api_key", "")
-    model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
-
+    """Generate a deep research response (agentic tool loop)."""
+    logger.info("researcher_generate invoked (tools=%s)", [t.name for t in RESEARCH_TOOLS])
     analysis = state.get("analysis") or {}
     system = RESEARCHER_SYSTEM
 
@@ -91,13 +90,25 @@ def researcher_generate(state: AgentState, config: RunnableConfig) -> dict[str, 
     if connector_data:
         system += "\n\n=== CONNECTOR DATA ===\n" + str(connector_data)
 
-    llm = _get_llm(api_key, model)
-    reply = invoke_text(llm, to_lc_messages(state.get("messages") or [], system), config)
+    result = run_agent_with_tools(
+        system,
+        state.get("messages") or [],
+        RESEARCH_TOOLS,
+        config,
+        temperature=0.3,
+    )
 
     return {
-        "reply": reply,
+        "reply": result["reply"],
         "active_agent": "researcher",
-        "agent_metadata": {"researcher": {"model": model, "used_rag": bool(rag)}},
+        "agent_metadata": {
+            "researcher": {
+                "model": result["model"],
+                "agentic": result["agentic"],
+                "tools_used": [t["tool"] for t in result["tool_trace"]],
+                "used_rag": bool(rag),
+            }
+        },
     }
 
 

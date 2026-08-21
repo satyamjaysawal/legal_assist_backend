@@ -1,27 +1,33 @@
-"""Assistant Agent — general legal Q&A.
+"""Assistant Agent — general legal Q&A (agentic).
 
 Handles simple questions, procedural queries, and general legal information.
 This is the default fallback agent for most queries.
+
+Agentic pattern: the LLM has the legal-dictionary tool bound via
+`bind_tools` and decides itself when a term lookup is needed
+(see agents/tool_loop_runner.py).
 """
 
+import logging
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
+from agents.tool_loop_runner import run_agent_with_tools
 from agents.base import (
     AgentState,
-    invoke_text,
-    latest_user_text,
-    message_text,
     register_agent,
-    to_lc_messages,
-    unpack_stream_part,
 )
+from agents.agent_tools import GENERAL_TOOLS
 
-_llm_cache: dict[str, Any] = {}
+logger = logging.getLogger("legal_assist.agents.assistant")
 
 ASSISTANT_SYSTEM = """You are the Assistant agent of a legal AI system.
 You handle general legal questions, procedural guidance, and legal information.
+
+Tools: you can call tools when they help — e.g. use define_legal_term to
+look up the exact meaning of a legal term before explaining it. Only call
+a tool when it actually adds value; otherwise answer directly.
 
 Guidelines:
 - Give clear, practical answers in plain language.
@@ -33,19 +39,9 @@ Guidelines:
 - Suggest consulting a lawyer for complex or high-stakes matters."""
 
 
-def _get_llm(api_key: str, model: str):
-    cache_key = f"asst:{model}"
-    if cache_key not in _llm_cache:
-        from agents.base import get_llm
-        _llm_cache[cache_key] = get_llm(api_key, model, temperature=0.4)
-    return _llm_cache[cache_key]
-
-
 def assistant_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """Generate a response for general legal questions."""
-    api_key = config.get("configurable", {}).get("api_key", "")
-    model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
-
+    """Generate a response for general legal questions (agentic tool loop)."""
+    logger.info("assistant_generate invoked (tools=%s)", [t.name for t in GENERAL_TOOLS])
     analysis = state.get("analysis") or {}
     system = ASSISTANT_SYSTEM
 
@@ -89,13 +85,24 @@ def assistant_generate(state: AgentState, config: RunnableConfig) -> dict[str, A
             "Use them when relevant and cite the filename.\n" + rag
         )
 
-    llm = _get_llm(api_key, model)
-    reply = invoke_text(llm, to_lc_messages(state.get("messages") or [], system), config)
+    result = run_agent_with_tools(
+        system,
+        state.get("messages") or [],
+        GENERAL_TOOLS,
+        config,
+        temperature=0.4,
+    )
 
     return {
-        "reply": reply,
+        "reply": result["reply"],
         "active_agent": "assistant",
-        "agent_metadata": {"assistant": {"model": model}},
+        "agent_metadata": {
+            "assistant": {
+                "model": result["model"],
+                "agentic": result["agentic"],
+                "tools_used": [t["tool"] for t in result["tool_trace"]],
+            }
+        },
     }
 
 

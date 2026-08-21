@@ -1,3 +1,4 @@
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -7,8 +8,8 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import HTTPException
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
-load_dotenv(Path(__file__).resolve().parent.parent / "legal_assist" / ".env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+load_dotenv(Path(__file__).resolve().parents[2] / "legal_assist" / ".env")
 
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -23,9 +24,9 @@ from qdrant_client.models import (
     VectorParams,
 )
 
-from embeddings import EMBED_DIM, GROQ_EMBED_MODEL, embed_texts
-from files import delete_original_file
-from memory import MONGO_DB, get_mongo
+from services.embedding_service import EMBED_DIM, GROQ_EMBED_MODEL, embed_texts
+from services.file_storage import delete_original_file
+from services.memory_service import MONGO_DB, get_mongo
 
 QDRANT_URL = os.getenv("QUDRANT_CLUSTER_ENDPOINT") or os.getenv("QDRANT_URL") or ""
 QDRANT_API_KEY = os.getenv("QUDRANT_VECTOR_DB_API_KEY") or os.getenv("QDRANT_API_KEY") or ""
@@ -35,6 +36,8 @@ CLOUD_EMBED_MODEL = os.getenv("QDRANT_CLOUD_EMBED_MODEL", "sentence-transformers
 CLOUD_EMBED_DIM = int(os.getenv("QDRANT_CLOUD_EMBED_DIM", "384"))
 DOCS_COLLECTION = "documents"
 SEARCH_LIMIT = int(os.getenv("QDRANT_SEARCH_LIMIT", "5"))
+
+logger = logging.getLogger("legal_assist.services.vector_store")
 
 _client: QdrantClient | None = None
 _qdrant_error = ""
@@ -59,6 +62,7 @@ def get_qdrant() -> QdrantClient | None:
         return _client
     except Exception as exc:
         _qdrant_error = str(exc)
+        logger.warning("Qdrant connection failed: %s", exc)
         return None
 
 

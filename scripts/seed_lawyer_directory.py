@@ -1,21 +1,30 @@
 r"""Seed Neon Postgres with sample lawyer directory data.
 
 Usage (from legal_assist_backend, with the venv):
-    .\.venv\Scripts\python.exe seed_neon.py            # seed if empty
-    .\.venv\Scripts\python.exe seed_neon.py --force    # wipe + reseed
+    .\.venv\Scripts\python.exe scripts\seed_lawyer_directory.py            # seed if empty
+    .\.venv\Scripts\python.exe scripts\seed_lawyer_directory.py --force    # wipe + reseed
 
 Creates two tables:
     lawyers        — profile, experience, fees, rating, availability
     lawyer_reviews — client reviews linked to lawyers
 """
 
+import logging
 import sys
+from pathlib import Path
+
+# Make the project root importable when running as `python scripts/...`
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv
 
-load_dotenv(".env")
+load_dotenv(PROJECT_ROOT / ".env")
 
 from connectors.neon_postgres import get_pg_conn, run_select  # noqa: E402
+
+logger = logging.getLogger("legal_assist.scripts.seed")
 
 DDL = """
 CREATE TABLE IF NOT EXISTS lawyers (

@@ -1,6 +1,6 @@
 # Legal Assist — Backend
 
-FastAPI chat API powering a **multi-agent legal AI assistant**: LangGraph orchestration, 7-layer memory, two-tier caching, RAG over uploaded documents, text-to-SQL on Neon Postgres, and a WebSocket lawyer chat — streamed over SSE with full pipeline visibility.
+FastAPI chat API powering a **multi-agent legal AI assistant**: LangGraph orchestration with **agentic tool-calling** (LangChain `bind_tools` + ToolNode loops), 7-layer memory, two-tier caching, RAG over uploaded documents, text-to-SQL on Neon Postgres, and a WebSocket lawyer chat — streamed over SSE with full pipeline visibility.
 
 | Layer | Stack |
 | --- | --- |
@@ -32,6 +32,7 @@ FastAPI chat API powering a **multi-agent legal AI assistant**: LangGraph orches
 ## Features
 
 - **Multi-agent orchestration** — root orchestrator classifies intent/domain/complexity and routes to 7 specialist agents (LangGraph)
+- **Agentic tool-calling** — specialists run LangChain `bind_tools` + LangGraph agent⇄ToolNode loops: the LLM decides when to call `query_lawyer_database`, `list_lawyers`, `define_legal_term`, `search_bare_acts`, `list_legal_templates`, `get_legal_template`; automatic fallback-chain retry + graceful degradation for non-tool models (see `PROJECT_DOCUMENTATION.md` §3.9 for the pattern)
 - **SSE streaming v2** — every pipeline stage is visible live: memory reads, cache hits, RAG, routing, agent work, cache/memory writes
 - **7-layer memory** — in-memory, short-term (Redis), user thread, long-term facts, semantic (Qdrant), episodic, procedural + user profile extraction
 - **Two-tier prompt caching** — exact-match (SHA-256, Redis + RAM, 6h TTL) and semantic (cosine-similarity, disabled by default via `SEMANTIC_CACHE_ENABLED`); personal queries (`who am I?`) always bypass cache so memory answers
@@ -47,16 +48,16 @@ FastAPI chat API powering a **multi-agent legal AI assistant**: LangGraph orches
 
 ## Agents
 
-| Agent | Handles intents | Role |
-| --- | --- | --- |
-| `orchestrator` | `*` | Root agent — analyses intent and routes to specialists |
-| `assistant` | question, procedure, other | General legal Q&A |
-| `researcher` | review, compare | Deep legal research, case law, document review |
-| `draft` | draft | Notices, agreements, letters, petitions |
-| `document_creator` | document | Structured documents — RTI, complaints, agreements |
-| `email` | email | Professional legal email composition |
-| `lawyer_finder` | find_lawyer | Lawyer directory search + live chat entry point |
-| `db_chat` | db_query | Text-to-SQL over the Neon lawyer directory |
+| Agent | Handles intents | Role | Bound tools |
+| --- | --- | --- | --- |
+| `orchestrator` | `*` | Root agent — analyses intent and routes to specialists | — |
+| `assistant` | question, procedure, other | General legal Q&A | `define_legal_term` |
+| `researcher` | review, compare | Deep legal research, case law, document review | `define_legal_term`, `search_bare_acts` |
+| `draft` | draft | Notices, agreements, letters, petitions | `list_legal_templates`, `get_legal_template` |
+| `document_creator` | document | Structured documents — RTI, complaints, agreements | `list_legal_templates`, `get_legal_template` |
+| `email` | email | Professional legal email composition | — (deterministic) |
+| `lawyer_finder` | find_lawyer | Lawyer directory search + live chat entry point | `list_lawyers`, `query_lawyer_database` |
+| `db_chat` | db_query | Text-to-SQL over the Neon lawyer directory | `query_lawyer_database` |
 
 ## Connectors
 
@@ -66,22 +67,32 @@ FastAPI chat API powering a **multi-agent legal AI assistant**: LangGraph orches
 
 ```
 legal_assist_backend/
-├── main.py               # FastAPI routes + SSE v2 pipeline
-├── multi_graph.py        # LangGraph multi-agent graph
-├── graph.py              # Legacy single-agent graph
-├── agents/               # orchestrator + 7 specialist agents
-├── connectors/           # legal data sources + Neon Postgres
-├── websocket/            # lawyer_connect.py — WS chat rooms
-├── memory.py             # 7-layer memory + profile extraction
-├── cache.py              # exact + semantic prompt caching
-├── embeddings.py         # Groq embeddings + FastEmbed fallback
-├── vectordb.py           # Qdrant semantic store
-├── docs.py / files.py    # document parsing + GridFS storage
-├── auth.py / journeys.py # JWT auth + chat journeys
-├── seed_neon.py          # seeds the Neon lawyer directory
-├── requirements.txt
-├── runtime.txt           # Python version for Vercel
-└── vercel.json           # @vercel/python → main.py
+├── main.py                 # FastAPI entry point — routes + SSE v2 pipeline
+├── core/                   # cross-cutting config
+│   └── logging_config.py   # central logging setup (LOG_LEVEL env)
+├── services/               # application services
+│   ├── auth_service.py     # JWT auth + role hierarchy
+│   ├── memory_service.py   # 7-layer memory + profile extraction
+│   ├── cache_service.py    # exact + semantic prompt caching
+│   ├── embedding_service.py# Groq embeddings + FastEmbed fallback
+│   ├── vector_store.py     # Qdrant semantic store (RAG)
+│   ├── document_processing.py # PDF/DOCX/text/image parsing + chunking
+│   ├── file_storage.py     # GridFS original-file storage
+│   └── journey_service.py  # chat journeys (Mongo)
+├── agents/                 # orchestrator + 7 specialist agents
+│   ├── multi_agent_graph.py# LangGraph multi-agent routing graph
+│   ├── legacy_chat_graph.py# legacy single-agent graph
+│   ├── tool_loop_runner.py # reusable bind_tools + LangGraph tool-loop
+│   ├── agent_tools.py      # @tool wrappers over the connectors
+│   └── *_agent.py          # one module per agent
+├── connectors/             # legal data sources + Neon Postgres
+├── websocket/              # lawyer_connect.py — WS chat rooms
+├── scripts/                # seed_lawyer_directory.py — Neon seeding
+├── tests/                  # pytest suite (59 tests, unittest-style)
+├── requirements.txt        # production deps (Vercel)
+├── requirements-dev.txt    # dev deps (pytest, httpx)
+├── runtime.txt             # Python version for Vercel
+└── vercel.json             # @vercel/python → main.py
 ```
 
 Full platform documentation: [PROJECT_DOCUMENTATION.md](./PROJECT_DOCUMENTATION.md)
@@ -102,6 +113,7 @@ Copy `.env.example` → `.env` for local development. **Never commit real secret
 | `NEON_POSTGRE_DB` | Neon Postgres pooler URL (lawyer directory / db_chat) |
 | `JWT_SECRET` | Token signing secret |
 | `SEMANTIC_CACHE_ENABLED` | Semantic cache kill-switch (`false` = off, default) |
+| `LOG_LEVEL` | Logging level (default `INFO`) |
 | `SMTP_*` | Outbound email for the email agent |
 | `CORS_ORIGINS` | Extra allowed origins (comma-separated) |
 
@@ -113,6 +125,7 @@ Copy `.env.example` → `.env` for local development. **Never commit real secret
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+pip install -r requirements-dev.txt   # pytest + httpx (optional, for tests)
 copy .env.example .env
 # fill in the keys in .env
 uvicorn main:app --reload --host 127.0.0.1 --port 8000
@@ -121,7 +134,7 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 Seed the lawyer directory once:
 
 ```powershell
-python seed_neon.py            # or: python seed_neon.py --force
+python scripts\seed_lawyer_directory.py            # or: ... --force
 ```
 
 | Service | URL |
@@ -129,6 +142,17 @@ python seed_neon.py            # or: python seed_neon.py --force
 | API | http://127.0.0.1:8000 |
 | Health | http://127.0.0.1:8000/health |
 | Swagger | http://127.0.0.1:8000/docs |
+
+## Tests
+
+The `tests/` suite (pytest, 59 cases, unittest-style classes) covers SQL
+validation, orchestrator routing, the agent registry, all @tool wrappers,
+the agentic tool loop (with a scripted fake LLM), cache + document
+services, and the public API endpoints — no external services required:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests -q
+```
 
 ## API overview
 

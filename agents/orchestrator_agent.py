@@ -6,6 +6,7 @@ multi-agent LangGraph.
 """
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -19,6 +20,8 @@ from agents.base import (
     register_agent,
     to_lc_messages,
 )
+
+logger = logging.getLogger("legal_assist.agents.orchestrator")
 
 # ── Import lazily to avoid circular imports at module level ──────
 _llm_cache: dict[str, Any] = {}
@@ -111,6 +114,7 @@ def parse_analysis(text: str, fallback_query: str) -> dict[str, Any]:
 
 def analyse_and_route(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     """Root agent node: analyse intent and decide routing."""
+    logger.info("analyse_and_route invoked — classifying intent")
     # Retrieve api_key and model from config
     api_key = config.get("configurable", {}).get("api_key", "")
     model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")

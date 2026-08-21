@@ -1,24 +1,26 @@
-"""Document Creator Agent — structured document generation.
+"""Document Creator Agent — structured document generation (agentic).
 
 Different from Draft agent: this agent focuses on filling templates,
 creating formatted documents (RTI, consumer complaints, rent agreements),
 and producing downloadable documents.
+
+Agentic pattern: template tools are bound to the LLM — it lists and
+fetches the matching template itself before building the document.
 """
 
-import json
+import logging
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
+from agents.tool_loop_runner import run_agent_with_tools
 from agents.base import (
     AgentState,
-    invoke_text,
-    latest_user_text,
     register_agent,
-    to_lc_messages,
 )
+from agents.agent_tools import TEMPLATE_TOOLS
 
-_llm_cache: dict[str, Any] = {}
+logger = logging.getLogger("legal_assist.agents.document_creator")
 
 DOC_CREATOR_SYSTEM = """You are the Document Creator agent of a legal AI system.
 You create structured, formatted legal documents from user requirements.
@@ -32,6 +34,13 @@ You specialise in:
 - Power of Attorney
 - Employment Contracts
 
+Tools: you have template tools bound to you:
+- list_legal_templates: discover available templates and their ids.
+- get_legal_template: fetch a template's structure and required fields.
+When the requested document matches a template (RTI, consumer complaint,
+rent agreement, legal notice), fetch it FIRST and build the document
+on top of its structure and fields.
+
 Guidelines:
 - Create a properly formatted, structured document.
 - Use standard legal formatting with appropriate headings and sections.
@@ -43,19 +52,9 @@ Guidelines:
 - After the document, list what information the user still needs to fill in."""
 
 
-def _get_llm(api_key: str, model: str):
-    cache_key = f"doccr:{model}"
-    if cache_key not in _llm_cache:
-        from agents.base import get_llm
-        _llm_cache[cache_key] = get_llm(api_key, model, temperature=0.3)
-    return _llm_cache[cache_key]
-
-
 def document_creator_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """Generate a structured legal document."""
-    api_key = config.get("configurable", {}).get("api_key", "")
-    model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
-
+    """Generate a structured legal document (agentic tool loop)."""
+    logger.info("document_creator_generate invoked (tools=%s)", [t.name for t in TEMPLATE_TOOLS])
     analysis = state.get("analysis") or {}
     system = DOC_CREATOR_SYSTEM
 
@@ -90,26 +89,22 @@ def document_creator_generate(state: AgentState, config: RunnableConfig) -> dict
     if rag:
         system += "\n\nReference documents:\n" + rag
 
-    # Use template connector for base structure
-    try:
-        from connectors.legal_templates import LegalTemplatesConnector
-        tpl_conn = LegalTemplatesConnector()
-        templates = tpl_conn.list_templates()
-        if templates.get("templates"):
-            tpl_names = [t["id"] for t in templates["templates"]]
-            system += f"\n\nAvailable template IDs: {tpl_names}"
-    except Exception:
-        pass
-
-    llm = _get_llm(api_key, model)
-    reply = invoke_text(llm, to_lc_messages(state.get("messages") or [], system), config)
+    result = run_agent_with_tools(
+        system,
+        state.get("messages") or [],
+        TEMPLATE_TOOLS,
+        config,
+        temperature=0.3,
+    )
 
     return {
-        "reply": reply,
+        "reply": result["reply"],
         "active_agent": "document_creator",
         "agent_metadata": {
             "document_creator": {
-                "model": model,
+                "model": result["model"],
+                "agentic": result["agentic"],
+                "tools_used": [t["tool"] for t in result["tool_trace"]],
                 "format": "structured_document",
                 "disclaimer": "AI-generated document — review by a qualified lawyer recommended.",
             }

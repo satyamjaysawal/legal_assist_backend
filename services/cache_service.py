@@ -8,7 +8,7 @@ from typing import Any
 
 import logging
 
-from memory import get_redis
+from services.memory_service import get_redis
 
 logger = logging.getLogger("legal_assist.cache")
 
@@ -224,7 +224,7 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
         report["detail"] = "Semantic index empty — first query stores it"
         return None, report
     try:
-        from embeddings import embed_texts
+        from services.embedding_service import embed_texts
 
         vectors, _emb = embed_texts([query], kind="query")
         qvec = vectors[0]
@@ -239,7 +239,7 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
     # Symmetric guard with the store: ultra-generic queries must not
     # match cached entries (they would get unrelated cached answers).
     try:
-        from embeddings import _tokenize
+        from services.embedding_service import _tokenize
 
         if len(_tokenize(query)) < SEMANTIC_MIN_TOKENS:
             report["detail"] = "Query too generic for semantic matching"
@@ -316,7 +316,7 @@ def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, A
         report["detail"] = "Semantic cache disabled (SEMANTIC_CACHE_ENABLED=false)"
         return report
     try:
-        from embeddings import embed_texts
+        from services.embedding_service import embed_texts
 
         vectors, _emb = embed_texts([query], kind="query")
         qvec = vectors[0]
@@ -330,7 +330,7 @@ def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, A
 
     # Guard: don't pollute the index with ultra-generic queries.
     try:
-        from embeddings import _tokenize
+        from services.embedding_service import _tokenize
 
         n_tokens = len(_tokenize(query))
     except Exception:

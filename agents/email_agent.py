@@ -4,6 +4,7 @@ Handles requests to write, compose, or format emails for legal purposes:
 client communication, notices, demand letters via email, follow-ups, etc.
 """
 
+import logging
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -15,6 +16,8 @@ from agents.base import (
     register_agent,
     to_lc_messages,
 )
+
+logger = logging.getLogger("legal_assist.agents.email")
 
 _llm_cache: dict[str, Any] = {}
 
@@ -61,6 +64,7 @@ def _get_llm(api_key: str, model: str):
 
 def email_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
     """Compose a professional legal email."""
+    logger.info("email_generate invoked (deterministic — no tools bound)")
     api_key = config.get("configurable", {}).get("api_key", "")
     model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
 

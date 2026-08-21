@@ -1,8 +1,10 @@
 """eCourts / court system connector (dummy)."""
 
+import logging
 from typing import Any
 from connectors.base import ConnectorStatus, register_connector
 
+logger = logging.getLogger("legal_assist.connectors.court_api")
 NAME = "court_api"
 
 
@@ -16,6 +18,7 @@ class CourtAPIConnector:
         return ConnectorStatus.unavailable(NAME)
 
     def check_case_status(self, case_number: str, court: str = "") -> dict[str, Any]:
+        logger.debug("check_case_status(case=%r) — dummy result", case_number)
         return {
             "connector": NAME,
             "available": False,

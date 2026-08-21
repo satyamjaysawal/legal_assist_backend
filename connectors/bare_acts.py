@@ -1,8 +1,10 @@
 """Bare Acts / India Code connector (dummy)."""
 
+import logging
 from typing import Any
 from connectors.base import ConnectorStatus, register_connector
 
+logger = logging.getLogger("legal_assist.connectors.bare_acts")
 NAME = "bare_acts"
 
 
@@ -16,6 +18,7 @@ class BareActsConnector:
         return ConnectorStatus.unavailable(NAME)
 
     def search(self, act_name: str, section: str = "", limit: int = 5) -> dict[str, Any]:
+        logger.debug("search(act=%r, section=%r) — dummy results", act_name, section)
         return {
             "connector": NAME,
             "available": False,

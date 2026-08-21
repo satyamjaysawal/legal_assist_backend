@@ -1,5 +1,6 @@
 import base64
 import io
+import logging
 import os
 import re
 from pathlib import Path
@@ -8,8 +9,10 @@ from typing import Any
 from dotenv import load_dotenv
 from groq import Groq
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
-load_dotenv(Path(__file__).resolve().parent.parent / "legal_assist" / ".env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+load_dotenv(Path(__file__).resolve().parents[2] / "legal_assist" / ".env")
+
+logger = logging.getLogger("legal_assist.services.document_processing")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
@@ -141,6 +144,7 @@ def parse_image(data: bytes, content_type: str, filename: str) -> str:
 
 
 def parse_file(filename: str, content_type: str, data: bytes) -> dict[str, Any]:
+    logger.info("parse_file: %s (%d bytes, type=%s)", filename, len(data or b""), content_type)
     if not data:
         raise ValueError("Empty file")
     if len(data) > MAX_UPLOAD_BYTES:

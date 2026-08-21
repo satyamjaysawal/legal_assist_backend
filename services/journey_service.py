@@ -1,12 +1,15 @@
+import logging
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 from fastapi import HTTPException
 
-from memory import MONGO_DB, get_mongo
+from services.memory_service import MONGO_DB, get_mongo
 
 JOURNEYS = "journeys"
+
+logger = logging.getLogger("legal_assist.services.journeys")
 
 
 def _now() -> str:
@@ -62,6 +65,7 @@ def create_journey(user_id: str, title: str = "") -> dict[str, Any]:
         "updated_at": now,
     }
     col.insert_one(doc)
+    logger.info("Journey created: %s (user=%s)", doc["journey_id"], user_id)
     return public_journey(doc, include_messages=True)
 
 
@@ -123,8 +127,8 @@ def delete_journey(user_id: str, journey_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Journey not found")
     cleaned = {"docs": 0, "memory": {}}
     try:
-        from memory import clear_journey_memory
-        from vectordb import delete_docs_for_journey
+        from services.memory_service import clear_journey_memory
+        from services.vector_store import delete_docs_for_journey
 
         cleaned["docs"] = delete_docs_for_journey(user_id, journey_id)
         cleaned["memory"] = clear_journey_memory(user_id, journey_id)
@@ -150,8 +154,8 @@ def delete_all_journeys(user_id: str) -> dict[str, Any]:
     cleaned_docs = 0
     cleaned_memory = 0
     try:
-        from memory import clear_journey_memory
-        from vectordb import delete_docs_for_journey
+        from services.memory_service import clear_journey_memory
+        from services.vector_store import delete_docs_for_journey
 
         for journey_id in journey_ids:
             try:

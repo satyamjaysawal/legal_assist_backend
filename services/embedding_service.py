@@ -13,8 +13,8 @@ from groq import Groq
 
 logger = logging.getLogger("legal_assist.embeddings")
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
-load_dotenv(Path(__file__).resolve().parent.parent / "legal_assist" / ".env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+load_dotenv(Path(__file__).resolve().parents[2] / "legal_assist" / ".env")
 
 _CACHE_DIR = os.getenv("FASTEMBED_CACHE_PATH") or os.path.join(tempfile.gettempdir(), "legal_assist_fastembed")
 os.environ.setdefault("FASTEMBED_CACHE_PATH", _CACHE_DIR)

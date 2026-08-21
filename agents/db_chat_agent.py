@@ -1,13 +1,20 @@
-"""DB Chat Agent — text-to-SQL over Neon Postgres.
+"""DB Chat Agent — text-to-SQL over Neon Postgres (agentic).
 
-Flow:
-    user question → LLM writes a SELECT (PostgreSQL dialect, schema-aware)
-                  → SQL is validated (read-only, single statement, row cap)
-                  → executed against Neon Postgres
-                  → LLM turns the fetched rows into a readable answer
+Agentic flow (LangChain bind_tools + LangGraph tool loop):
+    user question → the LLM reads the schema, writes a SELECT and calls
+                    the query_lawyer_database tool with it
+                  → the tool validates (read-only, single statement,
+                    row cap) and executes against Neon Postgres
+                  → rows come back as a ToolMessage
+                  → the LLM turns the fetched rows into a readable answer
 
-The SQL + row count are surfaced in agent_metadata so the UI can show
-exactly which query was generated and how many rows came back.
+The executed SQL + row count are lifted from the tool's ToolMessage
+payload into agent_metadata so the UI can show exactly which query was
+generated and how many rows came back — same SSE contract as before
+(main.py emits the `sql` event from it).
+
+If the model never calls the tool (or tool-calling is unavailable),
+the agent degrades to the classic deterministic text-to-SQL pipeline.
 """
 
 import json
@@ -17,6 +24,7 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
+from agents.tool_loop_runner import run_agent_with_tools
 from agents.base import (
     AgentState,
     invoke_text,
@@ -24,11 +32,38 @@ from agents.base import (
     register_agent,
     to_lc_messages,
 )
+from agents.agent_tools import DB_TOOLS
 
 logger = logging.getLogger("legal_assist.agents")
 
 _llm_cache: dict[str, Any] = {}
 
+DB_CHAT_SYSTEM = """You are the DB Chat agent of a legal AI assistant.
+You answer questions about the lawyer directory by querying a PostgreSQL
+database with the query_lawyer_database tool.
+
+Database schema:
+{schema}
+
+Workflow:
+1. Understand the user's question.
+2. Write ONE read-only SELECT (PostgreSQL dialect) using the schema above.
+   - Use ILIKE for fuzzy text matching; trim city/specialisation values.
+   - Prefer useful columns and sensible ORDER BY (rating DESC, experience_years DESC).
+   - Keep it under LIMIT 25.
+3. MANDATORY: call the query_lawyer_database tool with your SQL before
+   answering. Do NOT invent rows or answer from memory — only use the
+   rows the tool returns.
+4. If the tool returns an error or zero rows, fix the query and retry once
+   (e.g. broaden filters); otherwise explain honestly.
+5. Write the final answer in friendly Markdown:
+   - Lead with the direct answer; use a table when showing multiple records.
+   - Mention experience, fees, ratings, city etc. only if present in the rows.
+   - End with a one-line note that the data is sample/demo directory data.
+   - If the user shared their name (see profile), address them by it.
+- Output ONLY the final answer — never include reasoning or thinking traces."""
+
+# Deterministic fallback prompts (used when the model cannot use tools)
 SQL_GEN_SYSTEM = """You are the SQL generator of a legal-data assistant.
 The user asks questions about a PostgreSQL database. Write ONE read-only
 SELECT query (PostgreSQL dialect) that answers the question.
@@ -96,31 +131,11 @@ def _generate_sql(question: str, schema: str, api_key: str, model: str, config) 
     return stripped
 
 
-def db_chat_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """Generate SQL from the user's question, run it, and explain the rows."""
-    api_key = config.get("configurable", {}).get("api_key", "")
-    model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
-
-    from connectors.neon_postgres import (
-        get_schema,
-        run_select,
-        schema_ddl_text,
-        validate_select_sql,
-    )
+def _fallback_pipeline(state: AgentState, config: RunnableConfig, schema: str, api_key: str, model: str) -> dict[str, Any]:
+    """Classic deterministic text-to-SQL pipeline (no tool-calling)."""
+    from connectors.neon_postgres import get_schema, run_select, validate_select_sql  # noqa: PLC0415
 
     question = latest_user_text(state.get("messages") or [])
-    schema = schema_ddl_text()
-    if not schema:
-        return {
-            "reply": (
-                "I could not reach the lawyer directory database right now. "
-                "Please try again in a moment."
-            ),
-            "active_agent": "db_chat",
-            "agent_metadata": {"db_chat": {"error": "schema unavailable", "cache_error": True}},
-        }
-
-    # Step 1 — text-to-SQL
     raw_sql = _generate_sql(question, schema, api_key, model, config)
     clean_sql, err = validate_select_sql(raw_sql)
     if not clean_sql:
@@ -136,9 +151,8 @@ def db_chat_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any
             # exact-match cache replays the failure for 6 hours.
             "agent_metadata": {"db_chat": {"sql": raw_sql[:500], "error": err, "cache_error": True}},
         }
-    logger.info("db_chat executing SQL: %s", clean_sql)
+    logger.info("db_chat executing SQL (fallback pipeline): %s", clean_sql)
 
-    # Step 2 — execute against Neon
     try:
         result = run_select(clean_sql)
     except Exception as exc:
@@ -149,10 +163,7 @@ def db_chat_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any
             "agent_metadata": {"db_chat": {"sql": clean_sql, "error": str(exc)[:300], "cache_error": True}},
         }
 
-    rows = result["rows"]
-    rows_json = json.dumps(rows, indent=2, ensure_ascii=False, default=str)
-
-    # Step 3 — turn rows into a readable answer
+    rows_json = json.dumps(result["rows"], indent=2, ensure_ascii=False, default=str)
     system = ANSWER_SYSTEM.format(sql=clean_sql, row_count=result["row_count"], rows=rows_json)
     profile = (state.get("user_profile") or "").strip()
     if profile:
@@ -170,6 +181,62 @@ def db_chat_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any
                 "row_count": result["row_count"],
                 "columns": result["columns"],
                 "tables": sorted(get_schema().keys()),
+            }
+        },
+    }
+
+
+def db_chat_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    """Agentic text-to-SQL: the model calls query_lawyer_database itself."""
+    api_key = config.get("configurable", {}).get("api_key", "")
+    model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
+
+    from connectors.neon_postgres import get_schema, schema_ddl_text  # noqa: PLC0415
+
+    schema = schema_ddl_text()
+    if not schema:
+        return {
+            "reply": (
+                "I could not reach the lawyer directory database right now. "
+                "Please try again in a moment."
+            ),
+            "active_agent": "db_chat",
+            "agent_metadata": {"db_chat": {"error": "schema unavailable", "cache_error": True}},
+        }
+
+    # ── Agentic path: LLM decides the SQL and calls the tool ─────
+    system = DB_CHAT_SYSTEM.format(schema=schema)
+    profile = (state.get("user_profile") or "").strip()
+    if profile:
+        system += "\n\nUser profile:\n" + profile
+
+    result = run_agent_with_tools(
+        system,
+        state.get("messages") or [],
+        DB_TOOLS,
+        config,
+        temperature=0.2,
+        max_iterations=3,
+    )
+    db_info = (result.get("tool_payloads") or {}).get("query_lawyer_database")
+
+    # Degraded (no tool support) or the model never called the tool →
+    # fall back to the deterministic pipeline so SQL always gets executed.
+    if not result["agentic"] or db_info is None:
+        logger.info("db_chat: no tool query recorded (agentic=%s) — using fallback pipeline", result["agentic"])
+        return _fallback_pipeline(state, config, schema, api_key, model)
+
+    return {
+        "reply": result["reply"],
+        "active_agent": "db_chat",
+        "agent_metadata": {
+            "db_chat": {
+                "sql": db_info["sql"],
+                "row_count": db_info["row_count"],
+                "columns": db_info["columns"],
+                "tables": sorted(get_schema().keys()),
+                "agentic": True,
+                "tools_used": [t["tool"] for t in result["tool_trace"]],
             }
         },
     }

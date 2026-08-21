@@ -1,6 +1,9 @@
 """Base connector interface and registry."""
 
+import logging
 from typing import Any
+
+logger = logging.getLogger("legal_assist.connectors")
 
 
 class ConnectorStatus:
@@ -24,6 +27,7 @@ connector_registry: dict[str, Any] = {}
 
 def register_connector(name: str, instance: Any) -> None:
     connector_registry[name] = instance
+    logger.debug("Connector registered: %s", name)
 
 
 def get_connector(name: str) -> Any | None:
@@ -36,5 +40,6 @@ def list_connectors() -> list[dict[str, Any]]:
         try:
             results.append(inst.status())
         except Exception as exc:
+            logger.warning("Connector '%s' status check failed: %s", name, exc)
             results.append({"name": name, "available": False, "error": str(exc)})
     return results

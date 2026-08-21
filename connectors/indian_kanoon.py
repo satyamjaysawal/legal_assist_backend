@@ -1,8 +1,10 @@
 """Indian Kanoon connector — case law search (dummy)."""
 
+import logging
 from typing import Any
 from connectors.base import ConnectorStatus, register_connector
 
+logger = logging.getLogger("legal_assist.connectors.indian_kanoon")
 NAME = "indian_kanoon"
 
 
@@ -17,6 +19,7 @@ class IndianKanoonConnector:
         return ConnectorStatus.unavailable(NAME)
 
     def search(self, query: str, court: str = "all", year_from: int | None = None, limit: int = 5) -> dict[str, Any]:
+        logger.debug("search(query=%r, court=%s) — dummy results", query, court)
         return {
             "connector": NAME,
             "available": False,

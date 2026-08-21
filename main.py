@@ -13,12 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from auth import (
+from services.auth_service import (
     ALL_ROLES, ROLE_GUEST, ROLE_USER, ROLE_LAWYER, ROLE_ADMIN,
     current_user, login_user, make_token, register_user, update_user,
     optional_user, require_role,
 )
-from graph import (
+from agents.legacy_chat_graph import (
     DEFAULT_ANALYSIS,
     build_graph,
     latest_user_text,
@@ -26,7 +26,7 @@ from graph import (
     suggest_followups,
     suggest_title,
 )
-from multi_graph import build_multi_graph, stream_multi_graph
+from agents.multi_agent_graph import build_multi_graph, stream_multi_graph
 from agents.base import list_agents as list_registered_agents
 from connectors import list_connectors
 from connectors.base import get_connector
@@ -34,18 +34,18 @@ from websocket.lawyer_connect import (
     create_room, get_room, list_rooms, close_room,
     handle_user_websocket, handle_lawyer_websocket,
 )
-from journeys import create_journey, delete_all_journeys, delete_journey, get_journey, list_journeys, rename_journey
-from cache import (
+from services.journey_service import create_journey, delete_all_journeys, delete_journey, get_journey, list_journeys, rename_journey
+from services.cache_service import (
     SEMANTIC_CACHE_ENABLED,
     get_prompt_cache,
     set_prompt_cache,
     semantic_cache_lookup,
     semantic_cache_store,
 )
-from docs import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, chunk_text, parse_file
-from embeddings import embed_status
-from files import files_status, get_original_file, store_original_file
-from memory import (
+from services.document_processing import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, chunk_text, parse_file
+from services.embedding_service import embed_status
+from services.file_storage import files_status, get_original_file, store_original_file
+from services.memory_service import (
     compress_history,
     get_procedural_memory,
     get_user_profile,
@@ -57,7 +57,7 @@ from memory import (
     save_all,
     update_user_profile,
 )
-from vectordb import (
+from services.vector_store import (
     delete_doc,
     format_hits,
     get_doc,
@@ -75,10 +75,9 @@ load_dotenv(ROOT.parent / "legal_assist" / ".env")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+from core.logging_config import setup_logging  # noqa: E402
+
+setup_logging()
 logger = logging.getLogger("legal_assist.api")
 
 app = FastAPI(title="Legal AI Assistant")
@@ -107,7 +106,6 @@ class AuthPayload(BaseModel):
     email: str
     password: str
     name: str = ""
-    role: str = "user"
 
 
 class ProfileUpdate(BaseModel):
@@ -229,7 +227,9 @@ def health():
 
 @app.post("/auth/register")
 def auth_register(payload: AuthPayload):
-    user = register_user(payload.email, payload.password, payload.name, payload.role)
+    # Account roles are assigned through an administrative workflow.  Never
+    # trust a role supplied by a public registration request.
+    user = register_user(payload.email, payload.password, payload.name, ROLE_USER)
     token = make_token(user["user_id"], user["email"], user.get("role") or ROLE_USER)
     journey = create_journey(user["user_id"], "New chat")
     return {"token": token, "user": user, "journey": journey}
@@ -843,6 +843,11 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                     agent = event.get("agent") or routed_to
                     specialist_meta = event.get("agent_metadata") or {}
                     detail = f"Reply generated · {event.get('reply_chars') or 0} characters"
+                    # Agentic visibility — which tools the agent called
+                    agent_meta = specialist_meta.get(agent) or {}
+                    tools_used = agent_meta.get("tools_used") or []
+                    if tools_used:
+                        detail += f" · tools: {', '.join(tools_used)}"
                     db_info = (specialist_meta.get("db_chat") or {})
                     if db_info.get("sql"):
                         detail = (
@@ -1053,7 +1058,7 @@ def memory_profile_put(req: ProfileUpdateRequest, user: dict = Depends(current_u
 @app.delete("/memory/profile")
 def memory_profile_delete(user: dict = Depends(current_user)):
     """Delete user profile."""
-    from memory import get_mongo, MONGO_DB, PROFILE_COLLECTION
+    from services.memory_service import get_mongo, MONGO_DB, PROFILE_COLLECTION
     client = get_mongo()
     if client is None:
         raise HTTPException(status_code=500, detail="MongoDB unavailable")

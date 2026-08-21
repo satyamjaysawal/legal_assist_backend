@@ -1,4 +1,5 @@
 import os
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
@@ -7,11 +8,13 @@ import bcrypt
 import jwt
 from fastapi import Depends, Header, HTTPException
 
-from memory import MONGO_DB, get_mongo
+from services.memory_service import MONGO_DB, get_mongo
 
 USERS = "users"
 JWT_SECRET = os.getenv("JWT_SECRET", "legal-assist-change-me")
 JWT_HOURS = int(os.getenv("JWT_HOURS", "168"))
+
+logger = logging.getLogger("legal_assist.auth")
 
 # ── Role hierarchy ──────────────────────────────────────────────
 ROLE_GUEST = "guest"
@@ -88,6 +91,7 @@ def register_user(email: str, password: str, name: str, role: str = ROLE_USER) -
         "updated_at": _now(),
     }
     col.insert_one(doc)
+    logger.info("User registered: %s (role=%s)", email, role)
     return public_user(doc)
 
 
@@ -96,7 +100,9 @@ def login_user(email: str, password: str) -> dict[str, Any]:
     col = users_col()
     doc = col.find_one({"email": email})
     if not doc or not check_password(password, doc.get("password_hash") or ""):
+        logger.warning("Login failed for %s — invalid credentials", email)
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    logger.info("User logged in: %s", email)
     return public_user(doc)
 
 

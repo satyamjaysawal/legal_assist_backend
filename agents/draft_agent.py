@@ -1,26 +1,36 @@
-"""Draft Agent — legal document drafting.
+"""Draft Agent — legal document drafting (agentic).
 
 Handles requests to draft legal notices, agreements, letters,
 applications, and other legal documents.
+
+Agentic pattern: template tools (list_legal_templates, get_legal_template)
+are bound to the LLM — it fetches the matching template on demand and
+drafts on top of it.
 """
 
+import logging
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
+from agents.tool_loop_runner import run_agent_with_tools
 from agents.base import (
     AgentState,
-    invoke_text,
-    latest_user_text,
     register_agent,
-    to_lc_messages,
 )
+from agents.agent_tools import TEMPLATE_TOOLS
 
-_llm_cache: dict[str, Any] = {}
+logger = logging.getLogger("legal_assist.agents.draft")
 
 DRAFT_SYSTEM = """You are the Drafting agent of a legal AI system.
 You specialise in creating legal documents — notices, agreements, letters,
 applications, petitions, and affidavits.
+
+Tools: you have template tools bound to you:
+- list_legal_templates: see available document templates and their ids.
+- get_legal_template: fetch a template's structure/required fields by id.
+When the requested document matches a template, fetch it FIRST and use
+its structure as the base for your draft.
 
 Guidelines:
 - Draft in proper legal format with appropriate headings, sections, and clauses.
@@ -33,19 +43,9 @@ Guidelines:
 - If the user's jurisdiction is known, use that legal system's conventions."""
 
 
-def _get_llm(api_key: str, model: str):
-    cache_key = f"draft:{model}"
-    if cache_key not in _llm_cache:
-        from agents.base import get_llm
-        _llm_cache[cache_key] = get_llm(api_key, model, temperature=0.3)
-    return _llm_cache[cache_key]
-
-
 def draft_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """Generate a legal draft document."""
-    api_key = config.get("configurable", {}).get("api_key", "")
-    model = config.get("configurable", {}).get("model", "openai/gpt-oss-120b")
-
+    """Generate a legal draft document (agentic tool loop)."""
+    logger.info("draft_generate invoked (tools=%s)", [t.name for t in TEMPLATE_TOOLS])
     analysis = state.get("analysis") or {}
     system = DRAFT_SYSTEM
 
@@ -86,26 +86,22 @@ def draft_generate(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
             "\n\n=== REFERENCE DOCUMENTS (use as style/format guide) ===\n" + rag
         )
 
-    # Try to use template connector
-    try:
-        from connectors.legal_templates import LegalTemplatesConnector
-        templates = LegalTemplatesConnector().list_templates()
-        if templates.get("templates"):
-            system += "\n\nAvailable templates: " + str(
-                [t["name"] for t in templates["templates"]]
-            )
-    except Exception:
-        pass
-
-    llm = _get_llm(api_key, model)
-    reply = invoke_text(llm, to_lc_messages(state.get("messages") or [], system), config)
+    result = run_agent_with_tools(
+        system,
+        state.get("messages") or [],
+        TEMPLATE_TOOLS,
+        config,
+        temperature=0.3,
+    )
 
     return {
-        "reply": reply,
+        "reply": result["reply"],
         "active_agent": "draft",
         "agent_metadata": {
             "draft": {
-                "model": model,
+                "model": result["model"],
+                "agentic": result["agentic"],
+                "tools_used": [t["tool"] for t in result["tool_trace"]],
                 "document_type": analysis.get("domain", "general"),
                 "disclaimer": "AI-generated draft — review by a qualified lawyer recommended.",
             }

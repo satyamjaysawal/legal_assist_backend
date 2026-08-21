@@ -1,3 +1,4 @@
+import logging
 import os
 from io import BytesIO
 from typing import Any
@@ -6,9 +7,11 @@ from bson import ObjectId
 from gridfs import GridFS, NoFile
 from pymongo.errors import PyMongoError
 
-from memory import MONGO_DB, get_mongo
+from services.memory_service import MONGO_DB, get_mongo
 
 GRIDFS_BUCKET = os.getenv("MONGO_FILES_BUCKET", "files")
+
+logger = logging.getLogger("legal_assist.services.file_storage")
 
 
 def get_fs() -> GridFS:
@@ -56,6 +59,7 @@ def store_original_file(
         doc_id=doc_id,
         bytes=len(data),
     )
+    logger.info("Stored original file %s (%d bytes) as gridfs=%s", filename, len(data), file_id)
     return {
         "gridfs_id": str(file_id),
         "store": "mongodb_gridfs",
