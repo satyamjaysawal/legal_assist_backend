@@ -82,5 +82,55 @@ class TestDocumentProcessing(unittest.TestCase):
             parse_file("big.txt", "text/plain", b"x" * (MAX_UPLOAD_BYTES + 1))
 
 
+class TestPerUserCacheIsolation(unittest.TestCase):
+    """Privacy invariant: cached replies must never cross users."""
+
+    def test_cache_key_differs_per_user(self):
+        self.assertNotEqual(
+            prompt_cache_key("what is ipc", "model-a", "", "user-1"),
+            prompt_cache_key("what is ipc", "model-a", "", "user-2"),
+        )
+
+    def test_cross_user_exact_cache_isolation(self):
+        query = f"isolation probe {uuid.uuid4().hex}"
+        alice = f"alice-{uuid.uuid4().hex}"
+        bob = f"bob-{uuid.uuid4().hex}"
+        set_prompt_cache(query, "model-x", {"reply": "alice personalized reply"}, user_id=alice)
+
+        leak, _ = get_prompt_cache(query, "model-x", user_id=bob)
+        self.assertIsNone(leak, "user B must never read user A's cached reply")
+
+        own, report = get_prompt_cache(query, "model-x", user_id=alice)
+        self.assertIsNotNone(own)
+        self.assertEqual(own.get("reply"), "alice personalized reply")
+        self.assertTrue(report["used"])
+
+
+def test_semantic_cache_is_per_user(monkeypatch):
+    import services.cache_service as cs
+    import services.embedding_service as emb
+
+    monkeypatch.setattr(cs, "SEMANTIC_CACHE_ENABLED", True)
+    monkeypatch.setattr(
+        emb,
+        "embed_texts",
+        lambda texts, kind="query": ([[1.0, 0.0]] * len(texts), {"norms": [1.0] * len(texts)}),
+    )
+
+    alice = f"alice-{uuid.uuid4().hex}"
+    bob = f"bob-{uuid.uuid4().hex}"
+    query = f"semantic isolation probe about tenant eviction notice {uuid.uuid4().hex}"
+
+    set_prompt_cache(query, "model-x", {"reply": "alice answer"}, user_id=alice)
+    store = cs.semantic_cache_store(query, "model-x", user_id=alice)
+    assert store.get("wrote"), store
+
+    hit, _ = cs.semantic_cache_lookup(query, "model-x", user_id=alice)
+    assert hit is not None and hit["reply"] == "alice answer"
+
+    leak, _ = cs.semantic_cache_lookup(query, "model-x", user_id=bob)
+    assert leak is None, "semantic cache must not cross users"
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,10 +22,17 @@ SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.55"))
 # to cache semantically (e.g. "who am I", "help") — they would match
 # unrelated queries and serve wrong cached answers.
 SEMANTIC_MIN_TOKENS = int(os.getenv("SEMANTIC_MIN_TOKENS", "2"))
-SEMANTIC_INDEX_KEY = "legal_assist:scache:index"
 SEMANTIC_MAX_ENTRIES = int(os.getenv("SEMANTIC_MAX_ENTRIES", "300"))
 _local: dict[str, dict[str, Any]] = {}
 _sem_local: dict[str, dict[str, Any]] = {}
+
+# ── Privacy invariant ────────────────────────────────────────────
+# Every cache layer is strictly PER-USER. Replies are personalized from
+# the caller's memory (profile PII, facts, episodes), so a cache entry
+# written by user A must never be readable by user B. user_id is part of
+# every key/hash; there is no global (user-less) cache or memory store.
+# Entries written before this rule carried no user_id and are simply
+# unreachable now — they expire on their own TTL.
 
 
 def _now() -> str:
@@ -55,13 +62,13 @@ def is_personal_query(query: str) -> bool:
     return any(re.search(p, norm) for p in _PERSONAL_PATTERNS)
 
 
-def prompt_cache_id(query: str, model: str, extra: str = "") -> str:
-    raw = f"{model}|{normalize_prompt(query)}|{extra or 'none'}"
+def prompt_cache_id(query: str, model: str, extra: str = "", user_id: str = "") -> str:
+    raw = f"{user_id or 'anon'}|{model}|{normalize_prompt(query)}|{extra or 'none'}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def prompt_cache_key(query: str, model: str, extra: str = "") -> str:
-    return f"legal_assist:pcache:{prompt_cache_id(query, model, extra)}"
+def prompt_cache_key(query: str, model: str, extra: str = "", user_id: str = "") -> str:
+    return f"legal_assist:pcache:{user_id or 'anon'}:{prompt_cache_id(query, model, extra, user_id)}"
 
 
 def cache_status() -> dict[str, Any]:
@@ -74,9 +81,9 @@ def cache_status() -> dict[str, Any]:
     }
 
 
-def get_prompt_cache(query: str, model: str, extra: str = "") -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    cache_id = prompt_cache_id(query, model, extra)
-    key = prompt_cache_key(query, model, extra)
+def get_prompt_cache(query: str, model: str, extra: str = "", user_id: str = "") -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    cache_id = prompt_cache_id(query, model, extra, user_id)
+    key = prompt_cache_key(query, model, extra, user_id)
     report = {
         "name": "prompt_cache",
         "label": "Prompt cache",
@@ -126,7 +133,7 @@ def get_prompt_cache(query: str, model: str, extra: str = "") -> tuple[dict[str,
         return None, report
 
 
-def set_prompt_cache(query: str, model: str, payload: dict[str, Any], extra: str = "") -> dict[str, Any]:
+def set_prompt_cache(query: str, model: str, payload: dict[str, Any], extra: str = "", user_id: str = "") -> dict[str, Any]:
     if is_personal_query(query):
         return {
             "name": "prompt_cache",
@@ -136,7 +143,7 @@ def set_prompt_cache(query: str, model: str, payload: dict[str, Any], extra: str
             "when": _now(),
             "detail": "Personal query — never cached (memory-dependent answer)",
         }
-    key = prompt_cache_key(query, model, extra)
+    key = prompt_cache_key(query, model, extra, user_id)
     body = {
         "query": query,
         "model": model,
@@ -183,14 +190,18 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
-def _load_sem_index() -> dict[str, dict[str, Any]]:
-    """Merge the local semantic index with the Redis-backed one."""
-    merged = dict(_sem_local)
+def _sem_index_key(user_id: str) -> str:
+    return f"legal_assist:scache:index:{user_id or 'anon'}"
+
+
+def _load_sem_index(user_id: str) -> dict[str, dict[str, Any]]:
+    """Merge the local semantic index with the Redis-backed one (per user)."""
+    merged = {k: v for k, v in _sem_local.items() if (v.get("user_id") or "anon") == (user_id or "anon")}
     client = get_redis()
     if client is None:
         return merged
     try:
-        for entry_id, raw in (client.hgetall(SEMANTIC_INDEX_KEY) or {}).items():
+        for entry_id, raw in (client.hgetall(_sem_index_key(user_id)) or {}).items():
             try:
                 merged[entry_id] = json.loads(raw)
             except Exception:
@@ -200,7 +211,7 @@ def _load_sem_index() -> dict[str, dict[str, Any]]:
     return merged
 
 
-def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict[str, Any] | None, dict[str, Any]]:
+def semantic_cache_lookup(query: str, model: str, extra: str = "", user_id: str = "") -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Find a cached answer whose query embedding covers this query.
 
     Uses containment scoring — how much of THIS query's content is
@@ -219,7 +230,7 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
     if not SEMANTIC_CACHE_ENABLED:
         report.update(status="skip", detail="Semantic cache disabled (SEMANTIC_CACHE_ENABLED=false)")
         return None, report
-    index = _load_sem_index()
+    index = _load_sem_index(user_id)
     if not index:
         report["detail"] = "Semantic index empty — first query stores it"
         return None, report
@@ -277,7 +288,7 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
         )
         return None, report
 
-    key = prompt_cache_key(best_entry.get("query") or query, model, extra)
+    key = prompt_cache_key(best_entry.get("query") or query, model, extra, user_id)
     payload = _local.get(key)
     if payload is None:
         client = get_redis()
@@ -303,7 +314,7 @@ def semantic_cache_lookup(query: str, model: str, extra: str = "") -> tuple[dict
     return payload, report
 
 
-def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, Any]:
+def semantic_cache_store(query: str, model: str, extra: str = "", user_id: str = "") -> dict[str, Any]:
     """Embed this query and add it to the semantic cache index."""
     report: dict[str, Any] = {
         "name": "semantic_cache",
@@ -339,9 +350,10 @@ def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, A
         report["detail"] = f"Query too generic to cache semantically ({n_tokens} content token(s))"
         return report
 
-    entry_id = prompt_cache_id(query, model, extra) + "s"
+    entry_id = prompt_cache_id(query, model, extra, user_id) + "s"
     entry = {
         "id": entry_id,
+        "user_id": user_id or "anon",
         "query": query,
         "model": model,
         "vector": qvec,
@@ -356,13 +368,14 @@ def semantic_cache_store(query: str, model: str, extra: str = "") -> dict[str, A
     if client is None:
         return report
     try:
-        client.hset(SEMANTIC_INDEX_KEY, entry_id, json.dumps(entry))
-        client.expire(SEMANTIC_INDEX_KEY, PROMPT_CACHE_TTL * 2)
+        index_key = _sem_index_key(user_id)
+        client.hset(index_key, entry_id, json.dumps(entry))
+        client.expire(index_key, PROMPT_CACHE_TTL * 2)
         # Trim oldest entries beyond the cap
-        if client.hlen(SEMANTIC_INDEX_KEY) > SEMANTIC_MAX_ENTRIES:
-            all_entries = {k: json.loads(v) for k, v in client.hgetall(SEMANTIC_INDEX_KEY).items()}
+        if client.hlen(index_key) > SEMANTIC_MAX_ENTRIES:
+            all_entries = {k: json.loads(v) for k, v in client.hgetall(index_key).items()}
             for old_id in sorted(all_entries, key=lambda k: all_entries[k].get("cached_at", ""))[: len(all_entries) - SEMANTIC_MAX_ENTRIES]:
-                client.hdel(SEMANTIC_INDEX_KEY, old_id)
+                client.hdel(index_key, old_id)
                 _sem_local.pop(old_id, None)
         report.update(store="redis", detail=f"Stored query embedding in Redis semantic index (threshold {SEMANTIC_CACHE_THRESHOLD:.2f})")
     except Exception as exc:

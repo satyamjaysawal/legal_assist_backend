@@ -504,7 +504,7 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
             yield sse({"type": "retrieval", "report": rag_report, "hits": hits})
 
             yield sse({"type": "thinking", "text": "Checking prompt cache…"})
-            cached, cache_report = get_prompt_cache(query, GROQ_MODEL, rag_key)
+            cached, cache_report = get_prompt_cache(query, GROQ_MODEL, rag_key, user_id)
             yield sse({"type": "cache", "report": cache_report})
 
             if cached and cached.get("reply"):
@@ -589,6 +589,7 @@ def chat_stream(req: ChatRequest, user: dict = Depends(current_user)):
                         "title": title,
                     },
                     rag_key,
+                    user_id,
                 )
                 yield sse({"type": "cache_write", "report": cache_write})
                 stored = loaded["history"] + [{"role": "assistant", "content": reply}]
@@ -735,7 +736,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
 
             # ── Two-layer prompt cache: exact match, then semantic match ──
             yield sse({"type": "thinking", "text": "Checking exact-match cache…"})
-            cached, exact_report = get_prompt_cache(query, GROQ_MODEL)
+            cached, exact_report = get_prompt_cache(query, GROQ_MODEL, user_id=user_id)
             yield sse({"type": "cache", "report": exact_report})
             logger.info("Exact cache %s | %s", exact_report.get("status"), exact_report.get("detail"))
             yield step(
@@ -746,7 +747,7 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
             if not cached:
                 if SEMANTIC_CACHE_ENABLED:
                     yield sse({"type": "thinking", "text": "Checking semantic cache (embedding similarity)…"})
-                    sem_cached, sem_report = semantic_cache_lookup(query, GROQ_MODEL)
+                    sem_cached, sem_report = semantic_cache_lookup(query, GROQ_MODEL, user_id=user_id)
                     yield step(
                         "cache_semantic",
                         sem_report.get("status") or "miss",
@@ -997,9 +998,10 @@ def chat_stream_v2(req: ChatRequest, user: dict = Depends(current_user)):
                         query,
                         GROQ_MODEL,
                         {"reply": reply, "analysis": analysis or DEFAULT_ANALYSIS, "followups": followups, "title": title},
+                        user_id=user_id,
                     )
                 if SEMANTIC_CACHE_ENABLED:
-                    sem_write = semantic_cache_store(query, GROQ_MODEL)
+                    sem_write = semantic_cache_store(query, GROQ_MODEL, user_id=user_id)
                 else:
                     sem_write = {
                         "name": "semantic_cache",
